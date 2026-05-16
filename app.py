@@ -1,5 +1,5 @@
 """
-Smart Money Red Base Scanner - MVP V1.0 Yahoo Direct
+Smart Money Red Base Scanner - MVP V1.2 Money Flow Concentration
 Author: ChatGPT
 Purpose: Scan Vietnamese stock candidates using an early-accumulation, red-base buying style.
 
@@ -856,6 +856,69 @@ def scan_one_ticker(
         or (close > no_chase_level and very_high_vol_today and closes_weak)
     )
 
+    # Money flow engine - V1.2
+    # Cổ phiếu muốn lên phải có dòng tiền. Vì vậy bản này chấm riêng dòng tiền dựa trên
+    # giá trị giao dịch, up-value/down-value, OBV, CMF và hành vi tiền vào trong nền.
+    recent5 = tg.iloc[-5:].copy()
+    avg_value_5 = float(recent5["value"].mean()) if "value" in recent5 else float((recent5["close"] * recent5["volume"]).mean())
+    value_ratio_5_20 = avg_value_5 / avg_value_20 if avg_value_20 > 0 else np.nan
+    value_ratio_20_60 = avg_value_20 / avg_value_60 if avg_value_60 > 0 else np.nan
+
+    flow_ref = tg.copy()
+    flow_ref["ret"] = flow_ref["close"].pct_change()
+    flow_ref["signed_volume"] = np.sign(flow_ref["ret"].fillna(0)) * flow_ref["volume"]
+    flow_ref["obv"] = flow_ref["signed_volume"].cumsum()
+    flow20 = flow_ref.iloc[-20:].copy()
+    up_value = float(flow20.loc[flow20["ret"] > 0, "value"].sum()) if "value" in flow20 else float((flow20.loc[flow20["ret"] > 0, "close"] * flow20.loc[flow20["ret"] > 0, "volume"]).sum())
+    down_value = float(flow20.loc[flow20["ret"] < 0, "value"].sum()) if "value" in flow20 else float((flow20.loc[flow20["ret"] < 0, "close"] * flow20.loc[flow20["ret"] < 0, "volume"]).sum())
+    up_value_ratio = up_value / (up_value + down_value) if (up_value + down_value) > 0 else np.nan
+    obv20_slope = (float(flow_ref["obv"].iloc[-1]) - float(flow_ref["obv"].iloc[-20])) / max(float(flow20["volume"].sum()), 1.0) if len(flow_ref) >= 20 else np.nan
+    hl_range = (flow20["high"] - flow20["low"]).replace(0, np.nan)
+    mf_mult = ((flow20["close"] - flow20["low"]) - (flow20["high"] - flow20["close"])) / hl_range
+    cmf20 = float((mf_mult.fillna(0) * flow20["volume"]).sum() / max(flow20["volume"].sum(), 1.0)) if len(flow20) else np.nan
+
+    money_flow_score = 0.0
+    money_notes: List[str] = []
+    if pd.notna(value_ratio_5_20):
+        if value_ratio_5_20 >= 1.30:
+            money_flow_score += 5; money_notes.append("Giá trị giao dịch 5 phiên tăng mạnh so với 20 phiên: tiền đang chú ý nhanh.")
+        elif value_ratio_5_20 >= 1.10:
+            money_flow_score += 3; money_notes.append("Giá trị giao dịch 5 phiên tăng so với 20 phiên.")
+    if pd.notna(value_ratio_20_60):
+        if value_ratio_20_60 >= 1.15:
+            money_flow_score += 5; money_notes.append("Giá trị giao dịch 20 phiên cao hơn 60 phiên: dòng tiền vào nền tăng dần.")
+        elif value_ratio_20_60 >= 1.00:
+            money_flow_score += 3; money_notes.append("Giá trị giao dịch 20 phiên không suy yếu so với 60 phiên.")
+    if pd.notna(up_value_ratio):
+        if up_value_ratio >= 0.58:
+            money_flow_score += 5; money_notes.append("Up-value chiếm ưu thế: tiền vào các phiên tăng nhiều hơn tiền ra các phiên giảm.")
+        elif up_value_ratio >= 0.52:
+            money_flow_score += 3; money_notes.append("Up-value hơi nhỉnh hơn down-value.")
+    if pd.notna(obv20_slope):
+        if obv20_slope >= 0.12:
+            money_flow_score += 4; money_notes.append("OBV 20 phiên tăng rõ: lực gom tích lũy cải thiện.")
+        elif obv20_slope > 0:
+            money_flow_score += 2; money_notes.append("OBV 20 phiên có xu hướng tăng nhẹ.")
+    if pd.notna(cmf20):
+        if cmf20 >= 0.08:
+            money_flow_score += 4; money_notes.append("CMF 20 dương rõ: dòng tiền đóng cửa về phía giá cao trong phiên.")
+        elif cmf20 > 0:
+            money_flow_score += 2; money_notes.append("CMF 20 dương nhẹ.")
+    if absorption_days >= 2 and in_base:
+        money_flow_score += 2; money_notes.append("Dòng tiền vào đi kèm hấp thụ cung trong nền.")
+    if high_vol_today and in_base and not no_chase_level < close:
+        money_flow_score += 1; money_notes.append("Phiên hiện tại có volume cao nhưng vẫn còn trong nền.")
+    money_flow_score = min(25.0, money_flow_score)
+
+    if money_flow_score >= 18:
+        money_flow_state = "Dòng tiền vào rõ"
+    elif money_flow_score >= 13:
+        money_flow_state = "Dòng tiền tích lũy"
+    elif money_flow_score >= 8:
+        money_flow_state = "Dòng tiền trung bình"
+    else:
+        money_flow_state = "Dòng tiền yếu/chưa rõ"
+
     # Price location for red-base style
     in_red_buy_zone = base_low <= close <= zone_b_high
     in_zone_c = zone_c_low < close <= zone_c_high
@@ -943,11 +1006,46 @@ def scan_one_ticker(
         score_e -= 6; warnings.append("Giá đã thủng vùng dừng lỗ cấu trúc.")
     score_e = max(0.0, min(score_e, 10.0))
 
-    # F: Fundamentals + expectations - 15
+    # F: Fundamentals + expectations. In V1.2 this remains useful but is not allowed to dominate price/flow evidence.
     score_f, f_notes = score_fundamentals(ticker, fundamentals)
     notes.extend(f_notes)
+    notes.extend(money_notes[:8])
 
-    total_score = min(100.0, score_a + score_b + score_c + score_d + score_e + score_f)
+    # V1.2 weighting: dòng tiền là lõi chính để lọc cổ phiếu muốn lên.
+    score_a_w = score_a / 15 * 10       # sân chơi/tay to quan tâm
+    score_b_w = score_b / 25 * 20       # gom hàng/hấp thụ
+    score_c_w = score_c / 15 * 10       # sức mạnh tương đối
+    score_d_w = score_d / 20 * 15       # setup mua đỏ
+    score_e_w = score_e                 # rủi ro/no-chase
+    score_f_w = score_f / 15 * 10       # nền tảng/kỳ vọng
+    score_g_w = money_flow_score        # dòng tiền, tối đa 25
+    total_score = min(100.0, score_a_w + score_b_w + score_c_w + score_d_w + score_e_w + score_f_w + score_g_w)
+
+    # Concentration score: dùng để lọc ra 2-3 cổ tốt nhất trong nhóm cổ phiếu tốt.
+    concentration_score = (
+        money_flow_score / 25 * 35 +
+        score_b / 25 * 25 +
+        score_d / 20 * 15 +
+        score_c / 15 * 10 +
+        score_e / 10 * 10 +
+        score_f / 15 * 5
+    )
+    if distribution or close < stop:
+        concentration_score -= 25
+    if no_chase:
+        concentration_score -= 10
+    if not liquidity_pass:
+        concentration_score -= 8
+    concentration_score = max(0.0, min(100.0, concentration_score))
+
+    if concentration_score >= 75 and money_flow_score >= 16 and not distribution and not no_chase:
+        concentration_label = "TOP CÔ ĐẶC"
+    elif concentration_score >= 65 and money_flow_score >= 13 and not distribution:
+        concentration_label = "Ứng viên tốt"
+    elif money_flow_score < 8:
+        concentration_label = "Loại do dòng tiền yếu"
+    else:
+        concentration_label = "Theo dõi"
 
     # Phase classification
     if distribution:
@@ -958,19 +1056,23 @@ def scan_one_ticker(
         phase = "Thủng nền/suy yếu"
         signal = "Base Breakdown"
         action = "Loại hoặc chờ tạo nền mới"
+    elif money_flow_score < 8 and in_base:
+        phase = "Nền thiếu dòng tiền"
+        signal = "Weak Money Flow"
+        action = "Theo dõi, chưa ưu tiên cô đặc"
     elif breakout:
         phase = "Đã kéo/breakout"
         signal = "No Chase / Wait Retest"
         action = "Không mua xanh; chờ retest/nền mới"
-    elif shakeout_days >= 1 and in_base:
+    elif shakeout_days >= 1 and in_base and money_flow_score >= 8:
         phase = "Rũ cung trong nền"
         signal = "Shakeout Buy Zone"
         action = "Canh mua đỏ/thăm dò nếu giữ nền"
-    elif absorption_days >= 2 and in_base and (in_red_buy_zone or in_zone_c):
+    elif absorption_days >= 2 and in_base and (in_red_buy_zone or in_zone_c) and money_flow_score >= 10:
         phase = "Gom hàng trong nền"
         signal = "Red Base Accumulation"
         action = "Canh đỏ mua vùng nền thấp"
-    elif in_base and base_tight:
+    elif in_base and base_tight and money_flow_score >= 8:
         phase = "Tạo nền/siết nền"
         signal = "Early Watch"
         action = "Theo dõi, chỉ mua khi về vùng thấp"
@@ -982,9 +1084,65 @@ def scan_one_ticker(
     # Risk/reward: target = base high for early base buy; stop below base
     buy_ref = min(max(close, zone_a_low), zone_b_high) if in_red_buy_zone else (zone_b_high if close < zone_b_high else close)
     target_1 = base_high
+    target_2 = base_high + 0.5 * base_width
     risk = max(buy_ref - stop, 0.01)
     reward = max(target_1 - buy_ref, 0.0)
     rr = reward / risk if risk > 0 else np.nan
+
+    # Action-plan metrics for the user's preferred style: buy red/low in base, never chase green.
+    risk_pct_from_close = (close - stop) / close * 100 if close > 0 and pd.notna(stop) else np.nan
+    reward_pct_to_base_high = (base_high - close) / close * 100 if close > 0 and pd.notna(base_high) else np.nan
+    if close < zone_a_low:
+        distance_to_zone = f"dưới vùng A {abs((close / zone_a_low - 1) * 100):.1f}%"
+        current_position = "Dưới vùng mua - chỉ theo dõi hồi lại nền"
+    elif zone_a_low <= close <= zone_a_high:
+        distance_to_zone = "đang ở vùng A"
+        current_position = "Đẹp nhất nếu phiên đỏ và giữ nền"
+    elif zone_b_low <= close <= zone_b_high:
+        distance_to_zone = "đang ở vùng B"
+        current_position = "Có thể thăm dò nếu không xanh mạnh"
+    elif zone_c_low <= close <= zone_c_high:
+        distance_to_zone = "đang ở vùng C"
+        current_position = "Chỉ mua rất nhỏ nếu tín hiệu mạnh"
+    elif close > zone_b_high:
+        distance_to_zone = f"cao hơn vùng B {(close / zone_b_high - 1) * 100:.1f}%"
+        current_position = "Chờ rung lắc về vùng A/B"
+    else:
+        distance_to_zone = "ngoài vùng mua"
+        current_position = "Chờ tín hiệu rõ hơn"
+
+    if distribution:
+        action_decision = "TRÁNH MUA"
+        buy_trigger = "Không mở vị thế mới; chờ cổ phiếu tạo nền mới sau phân phối."
+        position_plan = "0% vị thế. Nếu đang nắm giữ, ưu tiên quản trị rủi ro theo hỗ trợ/cắt lỗ."
+    elif money_flow_score < 8:
+        action_decision = "CHƯA ƯU TIÊN - DÒNG TIỀN YẾU"
+        buy_trigger = "Chưa có bằng chứng dòng tiền đủ mạnh. Không cô đặc vốn vào mã này dù giá ở nền."
+        position_plan = "0% vị thế mới; chỉ theo dõi cho đến khi money flow cải thiện."
+    elif close < stop:
+        action_decision = "LOẠI/THEO DÕI LẠI SAU"
+        buy_trigger = "Nền đã bị vô hiệu; chỉ xem lại khi giá lấy lại nền và tạo nền mới."
+        position_plan = "Không trung bình giá xuống."
+    elif in_red_buy_zone and not no_chase:
+        action_decision = "CÓ THỂ CANH MUA ĐỎ"
+        buy_trigger = f"Chỉ mua khi giá đỏ/rung lắc trong {format_range(zone_a_low, zone_b_high)}, không đóng cửa dưới {safe_round_price(stop)}."
+        position_plan = "Thăm dò 30% ở vùng A; thêm 20-30% ở vùng B/rũ cung thành công; phần còn lại chờ nâng nền/retest."
+    elif in_zone_c and not no_chase:
+        action_decision = "CHỈ THĂM DÒ NHỎ"
+        buy_trigger = f"Chỉ mua nhỏ nếu có rút chân/hấp thụ rõ; ưu tiên chờ về {format_range(zone_a_low, zone_b_high)}."
+        position_plan = "Tối đa 10-20% vị thế vì giá không còn ở vùng đẹp nhất."
+    elif in_base and (score_b >= 12 or score_c >= 7):
+        action_decision = "CHỜ VỀ VÙNG MUA"
+        buy_trigger = f"Đặt cảnh báo khi giá về {format_range(zone_a_low, zone_b_high)}; không mua nếu xanh/sát kháng cự."
+        position_plan = "Chưa giải ngân; chuẩn bị kế hoạch mua đỏ khi về vùng thấp của nền."
+    elif breakout or no_chase:
+        action_decision = "KHÔNG ĐU XANH"
+        buy_trigger = "Không mua phiên kéo xanh/breakout; chỉ xem lại nếu retest nền mới với volume thấp."
+        position_plan = "0% vị thế mới theo phong cách mua đỏ."
+    else:
+        action_decision = "THEO DÕI"
+        buy_trigger = f"Chờ cổ phiếu tạo nền rõ hơn hoặc về vùng {format_range(zone_a_low, zone_b_high)}."
+        position_plan = "Chưa giải ngân."
 
     # Confidence based on total + risk context
     confidence = max(0, min(95, round(total_score * 0.8 + (10 if score_b >= 16 else 0) + (5 if score_c >= 8 else 0) - (10 if distribution else 0))))
@@ -1011,9 +1169,26 @@ def scan_one_ticker(
         "close": safe_round_price(close),
         "score": round(total_score, 1),
         "confidence": confidence,
+        "money_flow_score": round(money_flow_score, 1),
+        "money_flow_state": money_flow_state,
+        "concentration_score": round(concentration_score, 1),
+        "concentration_label": concentration_label,
+        "value_ratio_5_20": round(value_ratio_5_20, 2) if pd.notna(value_ratio_5_20) else np.nan,
+        "value_ratio_20_60": round(value_ratio_20_60, 2) if pd.notna(value_ratio_20_60) else np.nan,
+        "up_value_ratio_pct": round(up_value_ratio * 100, 1) if pd.notna(up_value_ratio) else np.nan,
+        "cmf20": round(cmf20, 3) if pd.notna(cmf20) else np.nan,
         "phase": phase,
         "signal": signal,
         "action": action,
+        "action_decision": action_decision,
+        "current_position": current_position,
+        "distance_to_zone": distance_to_zone,
+        "buy_trigger": buy_trigger,
+        "position_plan": position_plan,
+        "target_near": safe_round_price(target_1),
+        "target_extended": safe_round_price(target_2),
+        "risk_pct_from_close": round(risk_pct_from_close, 2) if pd.notna(risk_pct_from_close) and np.isfinite(risk_pct_from_close) else np.nan,
+        "reward_pct_to_base_high": round(reward_pct_to_base_high, 2) if pd.notna(reward_pct_to_base_high) and np.isfinite(reward_pct_to_base_high) else np.nan,
         "base_low": safe_round_price(base_low),
         "base_high": safe_round_price(base_high),
         "base_zone": format_range(base_low, base_high),
@@ -1032,12 +1207,13 @@ def scan_one_ticker(
         "today_ret_pct": round(today_ret * 100, 2),
         "rs20_pct": round(rs20 * 100, 2) if pd.notna(rs20) else np.nan,
         "rs10_pct": round(rs10 * 100, 2) if pd.notna(rs10) else np.nan,
-        "score_a_big_money": round(score_a, 1),
-        "score_b_accumulation": round(score_b, 1),
-        "score_c_relative_strength": round(score_c, 1),
-        "score_d_red_setup": round(score_d, 1),
-        "score_e_risk": round(score_e, 1),
-        "score_f_fundamental_expectation": round(score_f, 1),
+        "score_a_big_money": round(score_a_w, 1),
+        "score_b_accumulation": round(score_b_w, 1),
+        "score_c_relative_strength": round(score_c_w, 1),
+        "score_d_red_setup": round(score_d_w, 1),
+        "score_e_risk": round(score_e_w, 1),
+        "score_f_fundamental_expectation": round(score_f_w, 1),
+        "score_g_money_flow": round(score_g_w, 1),
         "notes": notes[:12],
         "warnings": warnings[:8],
     }
@@ -1060,13 +1236,14 @@ def run_scan(prices: pd.DataFrame, vnindex: pd.DataFrame, fundamentals: pd.DataF
         "Rũ cung trong nền": 1,
         "Gom hàng trong nền": 2,
         "Tạo nền/siết nền": 3,
-        "Đã kéo/breakout": 4,
-        "Chưa rõ": 5,
-        "Cảnh báo phân phối": 6,
-        "Thủng nền/suy yếu": 7,
+        "Nền thiếu dòng tiền": 4,
+        "Đã kéo/breakout": 5,
+        "Chưa rõ": 6,
+        "Cảnh báo phân phối": 7,
+        "Thủng nền/suy yếu": 8,
     }
     out["phase_rank"] = out["phase"].map(phase_rank).fillna(9)
-    out = out.sort_values(["phase_rank", "score", "rr_to_base_high"], ascending=[True, False, False]).drop(columns=["phase_rank"]).reset_index(drop=True)
+    out = out.sort_values(["phase_rank", "concentration_score", "money_flow_score", "score", "rr_to_base_high"], ascending=[True, False, False, False, False]).drop(columns=["phase_rank"]).reset_index(drop=True)
     return out, details
 
 
@@ -1125,8 +1302,8 @@ def make_candlestick_chart(tg: pd.DataFrame, detail: Dict) -> go.Figure:
 # -----------------------------
 def main():
     st.set_page_config(page_title="Smart Money Red Base Scanner", layout="wide")
-    st.title("Smart Money Red Base Scanner – Auto Data MVP V1.0 Yahoo Direct")
-    st.caption("Tự tải dữ liệu thị trường, quét dấu hiệu tay to gom hàng, ưu tiên mua đỏ trong nền. Bản V1.0: ưu tiên Yahoo Chart API trực tiếp, có nút chạy quét, giới hạn ít mã, bỏ qua nguồn dữ liệu chậm.")
+    st.title("Smart Money Red Base Scanner – Auto Data MVP V1.2 Money Flow")
+    st.caption("Tự tải dữ liệu thị trường, quét dấu hiệu tay to gom hàng, ưu tiên mua đỏ trong nền. Bản V1.2: thêm bộ lọc dòng tiền, xếp hạng cô đặc 2-3 mã tốt nhất, tránh dàn trải quá nhiều mã.")
 
     with st.expander("Triết lý hệ thống", expanded=False):
         st.markdown(
@@ -1203,6 +1380,11 @@ def main():
         volume_anomaly_mult=volume_mult,
         max_base_width_pct=max_base_width_pct,
     )
+
+    st.sidebar.header("3) Lọc cô đặc")
+    top_n_concentrated = st.sidebar.slider("Số mã cô đặc tốt nhất", 2, 5, 3, 1)
+    min_money_flow_for_top = st.sidebar.slider("Điểm dòng tiền tối thiểu", 0, 25, 10, 1, help="Muốn cô đặc thì không chọn mã thiếu dòng tiền. Mặc định 10/25 để không quá gắt khi quét ít mã.")
+    min_concentration_score = st.sidebar.slider("Điểm cô đặc tối thiểu", 0, 100, 55, 5)
 
     if data_mode.startswith("Tự động") and not run_scan_now:
         st.info("App đã sẵn sàng. Bấm **🚀 Chạy quét nhanh** ở thanh bên trái để bắt đầu tải dữ liệu. Mặc định chỉ chạy 10 mã/180 ngày để tránh treo trên Streamlit Cloud.")
@@ -1310,28 +1492,90 @@ def main():
         st.stop()
 
     # Overview metrics
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Số mã đã quét", f"{len(scan_df)}")
     c2.metric("Cơ hội mua đỏ", f"{scan_df['signal'].isin(['Red Base Accumulation', 'Shakeout Buy Zone']).sum()}")
-    c3.metric("Cảnh báo phân phối", f"{(scan_df['signal'] == 'Distribution Warning').sum()}")
-    c4.metric("Điểm cao nhất", f"{scan_df['score'].max():.1f}")
+    c3.metric("Dòng tiền vào rõ/tích lũy", f"{scan_df['money_flow_state'].isin(['Dòng tiền vào rõ', 'Dòng tiền tích lũy']).sum()}")
+    c4.metric("Cảnh báo phân phối", f"{(scan_df['signal'] == 'Distribution Warning').sum()}")
+    c5.metric("Điểm cô đặc cao nhất", f"{scan_df['concentration_score'].max():.1f}")
+
+    st.subheader("Top 2-3 mã cô đặc theo dòng tiền")
+    st.caption("Bảng này lọc tiếp từ nhóm cổ phiếu tốt: ưu tiên dòng tiền, gom hàng, vị trí giá trong nền và rủi ro. Mục tiêu là tránh dàn trải, chỉ chọn vài mã tốt nhất để theo dõi sát.")
+    concentrated_df = scan_df[
+        (scan_df["money_flow_score"] >= min_money_flow_for_top) &
+        (scan_df["concentration_score"] >= min_concentration_score) &
+        (~scan_df["action_decision"].isin(["TRÁNH MUA", "LOẠI/THEO DÕI LẠI SAU", "CHƯA ƯU TIÊN - DÒNG TIỀN YẾU"]))
+    ].copy()
+    concentrated_df = concentrated_df.sort_values(["concentration_score", "money_flow_score", "score"], ascending=[False, False, False]).head(top_n_concentrated)
+    if concentrated_df.empty:
+        st.warning("Chưa có mã nào đạt bộ lọc cô đặc. Có thể giảm ngưỡng dòng tiền/cô đặc, hoặc quét thêm mã, nhưng không nên hạ tiêu chuẩn quá mức.")
+    else:
+        top_cols = [
+            "ticker", "sector", "concentration_score", "concentration_label", "money_flow_score", "money_flow_state",
+            "score", "action_decision", "phase", "close", "red_buy_zone", "stop_loss", "rr_to_base_high", "buy_trigger"
+        ]
+        st.dataframe(
+            concentrated_df[top_cols],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "concentration_score": st.column_config.ProgressColumn("Điểm cô đặc", min_value=0, max_value=100),
+                "money_flow_score": st.column_config.ProgressColumn("Điểm dòng tiền", min_value=0, max_value=25),
+                "score": st.column_config.ProgressColumn("Tổng điểm", min_value=0, max_value=100),
+                "rr_to_base_high": st.column_config.NumberColumn("R/R", format="%.2f"),
+            },
+        )
+
+    st.subheader("Bảng hành động thực chiến")
+    st.caption("Ưu tiên đọc bảng này trước: app không khuyến nghị mua đuổi, chỉ đưa kế hoạch có điều kiện theo phong cách mua đỏ trong nền.")
+    only_actionable = st.toggle("Chỉ hiện mã có thể canh mua đỏ / chờ về vùng mua", value=False)
+    action_df = scan_df.copy()
+    if only_actionable:
+        action_df = action_df[action_df["action_decision"].isin(["CÓ THỂ CANH MUA ĐỎ", "CHỈ THĂM DÒ NHỎ", "CHỜ VỀ VÙNG MUA"])]
+    action_cols = [
+        "ticker", "sector", "concentration_score", "money_flow_score", "money_flow_state", "score", "confidence",
+        "action_decision", "phase", "close", "current_position", "red_buy_zone", "distance_to_zone",
+        "stop_loss", "risk_pct_from_close", "target_near", "reward_pct_to_base_high", "rr_to_base_high",
+        "buy_trigger", "no_buy_when",
+    ]
+    st.dataframe(
+        action_df[action_cols],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "concentration_score": st.column_config.ProgressColumn("Cô đặc", min_value=0, max_value=100),
+            "money_flow_score": st.column_config.ProgressColumn("Dòng tiền", min_value=0, max_value=25),
+            "score": st.column_config.ProgressColumn("Điểm", min_value=0, max_value=100),
+            "confidence": st.column_config.ProgressColumn("Độ tin cậy", min_value=0, max_value=100),
+            "risk_pct_from_close": st.column_config.NumberColumn("Rủi ro tới cắt lỗ %", format="%.2f"),
+            "reward_pct_to_base_high": st.column_config.NumberColumn("Dư địa tới đỉnh nền %", format="%.2f"),
+            "rr_to_base_high": st.column_config.NumberColumn("R/R", format="%.2f"),
+        },
+    )
 
     st.subheader("Bảng quét tổng hợp")
     display_cols = [
-        "ticker", "sector", "score", "confidence", "phase", "signal", "action", "close",
-        "base_zone", "red_buy_zone", "buy_zone_a", "buy_zone_b", "buy_zone_c", "stop_loss",
-        "rr_to_base_high", "today_ret_pct", "rs20_pct", "no_buy_when",
+        "ticker", "sector", "concentration_score", "money_flow_score", "money_flow_state", "score", "confidence",
+        "phase", "signal", "action", "close", "base_zone", "red_buy_zone", "buy_zone_a", "buy_zone_b",
+        "buy_zone_c", "stop_loss", "rr_to_base_high", "today_ret_pct", "rs20_pct", "value_ratio_5_20",
+        "value_ratio_20_60", "up_value_ratio_pct", "cmf20", "no_buy_when",
     ]
     st.dataframe(
         scan_df[display_cols],
         use_container_width=True,
         hide_index=True,
         column_config={
+            "concentration_score": st.column_config.ProgressColumn("Cô đặc", min_value=0, max_value=100),
+            "money_flow_score": st.column_config.ProgressColumn("Dòng tiền", min_value=0, max_value=25),
             "score": st.column_config.ProgressColumn("Điểm", min_value=0, max_value=100),
             "confidence": st.column_config.ProgressColumn("Độ tin cậy", min_value=0, max_value=100),
             "rr_to_base_high": st.column_config.NumberColumn("R/R tới đỉnh nền", format="%.2f"),
             "today_ret_pct": st.column_config.NumberColumn("% hôm nay", format="%.2f"),
             "rs20_pct": st.column_config.NumberColumn("RS20 vs VNIndex %", format="%.2f"),
+            "value_ratio_5_20": st.column_config.NumberColumn("GTGD 5/20", format="%.2f"),
+            "value_ratio_20_60": st.column_config.NumberColumn("GTGD 20/60", format="%.2f"),
+            "up_value_ratio_pct": st.column_config.NumberColumn("Up-value %", format="%.1f"),
+            "cmf20": st.column_config.NumberColumn("CMF20", format="%.3f"),
         },
     )
 
@@ -1350,7 +1594,18 @@ def main():
 
     with right:
         st.markdown(f"### {ticker_choice} – {detail['phase']}")
-        st.markdown(f"**Điểm:** {detail['score']}/100  \n**Độ tin cậy:** {detail['confidence']}%  \n**Tín hiệu:** {detail['signal']}  \n**Hành động:** {detail['action']}")
+        st.markdown(f"**Điểm:** {detail['score']}/100  \n**Điểm cô đặc:** {detail['concentration_score']}/100  \n**Dòng tiền:** {detail['money_flow_score']}/25 – {detail['money_flow_state']}  \n**Độ tin cậy:** {detail['confidence']}%  \n**Tín hiệu:** {detail['signal']}  \n**Hành động:** {detail['action']}")
+        st.markdown("#### Dòng tiền")
+        st.write(f"- Trạng thái: **{detail['money_flow_state']}**")
+        st.write(f"- GTGD 5/20 phiên: **{detail['value_ratio_5_20']}x** | GTGD 20/60 phiên: **{detail['value_ratio_20_60']}x**")
+        st.write(f"- Up-value ratio: **{detail['up_value_ratio_pct']}%** | CMF20: **{detail['cmf20']}**")
+        st.markdown("#### Kế hoạch hành động")
+        st.write(f"- Quyết định hiện tại: **{detail['action_decision']}**")
+        st.write(f"- Vị trí giá hiện tại: **{detail['current_position']}**")
+        st.write(f"- Khoảng cách tới vùng mua: **{detail['distance_to_zone']}**")
+        st.write(f"- Điều kiện mua: **{detail['buy_trigger']}**")
+        st.write(f"- Kế hoạch tỷ trọng: **{detail['position_plan']}**")
+        st.write(f"- Rủi ro tới cắt lỗ: **{detail['risk_pct_from_close']}%** | Dư địa tới đỉnh nền: **{detail['reward_pct_to_base_high']}%** | R/R: **{detail['rr_to_base_high']}**")
         st.markdown("#### Vùng giá")
         st.write(f"- Vùng nền: **{detail['base_zone']}**")
         st.write(f"- Vùng mua đỏ tổng: **{detail['red_buy_zone']}**")
@@ -1364,12 +1619,13 @@ def main():
         st.markdown("#### Điểm thành phần")
         comp = pd.DataFrame(
             [
-                ["Tay to có thể quan tâm", detail["score_a_big_money"], 15],
-                ["Gom hàng/hấp thụ", detail["score_b_accumulation"], 25],
-                ["Sức mạnh tương đối", detail["score_c_relative_strength"], 15],
-                ["Setup mua đỏ", detail["score_d_red_setup"], 20],
+                ["Sân chơi/tay to quan tâm", detail["score_a_big_money"], 10],
+                ["Gom hàng/hấp thụ", detail["score_b_accumulation"], 20],
+                ["Sức mạnh tương đối", detail["score_c_relative_strength"], 10],
+                ["Setup mua đỏ", detail["score_d_red_setup"], 15],
                 ["Rủi ro/không mua đuổi", detail["score_e_risk"], 10],
-                ["Nền tảng & kỳ vọng", detail["score_f_fundamental_expectation"], 15],
+                ["Nền tảng & kỳ vọng", detail["score_f_fundamental_expectation"], 10],
+                ["Dòng tiền", detail["score_g_money_flow"], 25],
             ],
             columns=["Nhóm", "Điểm", "Tối đa"],
         )
