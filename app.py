@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Market Winner Scanner V1.8 VN Volatility", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Market Winner Scanner V2.0 Late Cycle Guard", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # UNIVERSE
@@ -485,43 +485,134 @@ def choose_vn_base(d: pd.DataFrame, cfg: Dict) -> Tuple[pd.DataFrame, float, flo
 
 
 def analyze_one(t, g, market, cfg):
-    d = enrich(g); last = d.iloc[-1]
-    base, base_low, base_high, base_range_pct, base_method = choose_vn_base(d, cfg)
+    d = enrich(g)
+    last = d.iloc[-1]
+    raw_base, raw_base_low, raw_base_high, raw_base_range_pct, raw_base_method = choose_vn_base(d, cfg)
     close = float(last.close)
-    base_mid = (base_low + base_high) / 2
-    atr = float(last.atr14) if np.isfinite(last.atr14) and last.atr14 > 0 else max(close * 0.018, (base_high-base_low)/8)
+    atr = float(last.atr14) if np.isfinite(last.atr14) and last.atr14 > 0 else max(close * 0.018, (raw_base_high-raw_base_low)/8)
     atr_pct = atr / close * 100 if close > 0 else np.nan
 
     # ========================================================
-    # VN RED BUY ZONE ENGINE
-    # Cổ phiếu VN thường đi lên chậm, giảm nhanh; biên 1 phiên không lớn.
-    # Vì vậy vùng mua đỏ phải hẹp quanh hỗ trợ, không lấy 1/3 toàn bộ nền.
+    # V1.9 PRACTICAL ZONE ENGINE
+    # Không dùng nền cũ nếu giá đã rời nền quá xa. Ví dụ VIC giá 228k mà nền cũ 130k:
+    # app phải báo CHỜ NỀN MỚI/PULLBACK GẦN, không được đưa vùng mua 130k phi thực tế.
     # ========================================================
-    max_buy_pct = float(cfg.get("vn_red_zone_pct", 4.5)) / 100.0
-    zone_a_pct = float(cfg.get("zone_a_pct", 1.8)) / 100.0
-    zone_b_pct = float(cfg.get("zone_b_pct", 3.2)) / 100.0
-    zone_c_pct = float(cfg.get("zone_c_pct", 4.8)) / 100.0
+    max_action_pullback_pct = float(cfg.get("max_action_pullback_pct", 7.0))
+    max_action_pullback = max_action_pullback_pct / 100.0
+    no_chase_pct = float(cfg.get("vn_no_chase_pct", 6.0)) / 100.0
+
+    ema10 = float(d.close.ewm(span=10, adjust=False).mean().iloc[-1])
+    ema20 = float(d.close.ewm(span=20, adjust=False).mean().iloc[-1])
+    ema50 = float(d.close.ewm(span=50, adjust=False).mean().iloc[-1]) if len(d) >= 55 else float(d.close.rolling(min(30, len(d))).mean().iloc[-1])
+    ret20 = float(d.close.iloc[-1] / d.close.iloc[-21] - 1) if len(d) >= 22 else 0.0
+    ret60 = float(d.close.iloc[-1] / d.close.iloc[-61] - 1) if len(d) >= 62 else 0.0
+    # V2.0 LATE CYCLE GUARD
+    # Không nhầm cổ phiếu đã tăng nhiều lần với cổ phiếu còn vùng mua tốt.
+    cycle_lookback = min(252, max(2, len(d) - 1))
+    cycle_ref = float(d.close.iloc[-cycle_lookback]) if cycle_lookback < len(d) else float(d.close.iloc[0])
+    cycle_return_pct = (close / cycle_ref - 1) * 100 if cycle_ref > 0 else 0.0
+    low_lookback = d.tail(min(252, len(d)))
+    low_lookback_min = float(low_lookback.low.min()) if len(low_lookback) else close
+    runup_from_low_pct = (close / low_lookback_min - 1) * 100 if low_lookback_min > 0 else 0.0
+    ema100 = float(d.close.ewm(span=100, adjust=False).mean().iloc[-1]) if len(d) >= 80 else ema50
+    ema200 = float(d.close.ewm(span=200, adjust=False).mean().iloc[-1]) if len(d) >= 120 else ema100
+    ema50_gap_pct = (close / ema50 - 1) * 100 if ema50 > 0 else 0.0
+    ema100_gap_pct = (close / ema100 - 1) * 100 if ema100 > 0 else 0.0
+    ema200_gap_pct = (close / ema200 - 1) * 100 if ema200 > 0 else 0.0
+    recent10 = d.tail(min(10, len(d)))
+    recent20 = d.tail(min(20, len(d)))
+    recent30 = d.tail(min(30, len(d)))
+    new_base_range_pct = np.nan
+    new_base_mature = False
+    if len(recent20) >= 15:
+        nb_low = float(recent20.low.quantile(0.12))
+        nb_high = float(recent20.high.quantile(0.88))
+        new_base_range_pct = (nb_high / nb_low - 1) * 100 if nb_low > 0 else np.nan
+        # Nền mới hợp lệ sau siêu tăng phải hẹp, đi ngang đủ phiên và không còn dựng đứng.
+        new_base_mature = bool(np.isfinite(new_base_range_pct) and new_base_range_pct <= float(cfg.get("late_new_base_max_pct", 10.0)) and abs(ret20*100) <= 12 and close <= nb_high * 1.03)
+    recent_high = float(recent20.high.max()) if len(recent20) else close
+    recent_low_q = float(recent20.low.quantile(0.25)) if len(recent20) else close
+    swing_low10 = float(recent10.low.min()) if len(recent10) else close
+    pullback_floor = close * (1 - max_action_pullback)
+
+    old_base_far = False
+    if raw_base_high > 0:
+        old_base_far = close > raw_base_high * (1 + no_chase_pct) or close > raw_base_low * (1 + float(cfg.get("vn_base_cap_pct", 16.0))/100.0 + no_chase_pct)
+    trend_up = close > ema20 and ema20 >= ema50 * 0.985 and ret20 > 0.03
+
+    zone_model = "Nền gần hiện tại"
+    zone_valid = True
+    practical_note = ""
+
+    if old_base_far or (trend_up and close > raw_base_high * 1.04):
+        # Cổ đã chạy khỏi nền cũ: chỉ dùng hỗ trợ động gần giá hiện tại.
+        supports = [ema10, ema20, recent_low_q, swing_low10]
+        supports = [float(x) for x in supports if np.isfinite(x) and x > 0 and x < close * 0.997]
+        viable = [x for x in supports if x >= pullback_floor]
+        if viable:
+            base_low = max(viable)  # hỗ trợ gần nhất dưới giá, không phải nền cũ quá xa
+            base_high = max(recent_high, close)
+            base_method = f"V1.9 hỗ trợ động gần giá: EMA/low 10–20 phiên; bỏ nền cũ {fmt(raw_base_low)}–{fmt(raw_base_high)}"
+            zone_model = "Pullback gần trong trend"
+            base_range_pct = (base_high / base_low - 1) * 100 if base_low > 0 else np.nan
+        else:
+            # Không có hỗ trợ thực tế trong phạm vi chờ. Không giả vờ có điểm mua.
+            base_low = pullback_floor
+            base_high = close
+            base_method = f"V1.9 không có hỗ trợ gần; nền cũ quá xa {fmt(raw_base_low)}–{fmt(raw_base_high)}"
+            base_range_pct = max_action_pullback_pct
+            zone_model = "Không có vùng mua thực tế"
+            zone_valid = False
+            practical_note = f"Giá đã rời nền cũ; không chờ về {fmt(raw_base_low)}. Chỉ xem lại khi tạo nền mới hoặc pullback không quá {max_action_pullback_pct:.1f}% từ giá hiện tại."
+    else:
+        base_low, base_high, base_range_pct, base_method = raw_base_low, raw_base_high, raw_base_range_pct, raw_base_method
+
+    base_mid = (base_low + base_high) / 2
+
+    # Vùng mua đỏ thực tế: nếu là nền thì bám đáy nền; nếu là trend thì bám hỗ trợ động gần.
+    max_buy_pct = min(float(cfg.get("vn_red_zone_pct", 4.5)) / 100.0, max_action_pullback)
+    if zone_model == "Pullback gần trong trend":
+        zone_a_pct = 0.010
+        zone_b_pct = min(0.026, max_buy_pct)
+        zone_c_pct = min(0.040, max_buy_pct + 0.012)
+        atr_a, atr_b, atr_c = 0.55, 1.05, 1.55
+    else:
+        zone_a_pct = float(cfg.get("zone_a_pct", 1.8)) / 100.0
+        zone_b_pct = min(float(cfg.get("zone_b_pct", 3.2)) / 100.0, max_buy_pct)
+        zone_c_pct = min(float(cfg.get("zone_c_pct", 4.8)) / 100.0, max_buy_pct + 0.015)
+        atr_a, atr_b, atr_c = 0.9, 1.6, 2.4
 
     zA1 = base_low
-    zA2 = min(base_low * (1 + zone_a_pct), base_low + 0.9 * atr)
+    zA2 = min(base_low * (1 + zone_a_pct), base_low + atr_a * atr, close * 0.995, base_high)
     zB1 = zA2
-    zB2 = min(base_low * (1 + zone_b_pct), base_low + 1.6 * atr, base_low * (1 + max_buy_pct), base_high)
+    zB2 = min(base_low * (1 + zone_b_pct), base_low + atr_b * atr, close * 0.995, base_high)
     zC1 = zB2
-    zC2 = min(base_low * (1 + zone_c_pct), base_low + 2.4 * atr, base_high)
-    if zA2 <= zA1: zA2 = min(base_low * 1.018, base_high)
-    if zB2 <= zB1: zB2 = min(base_low * 1.032, base_high)
-    if zC2 <= zC1: zC2 = min(base_low * 1.048, base_high)
+    zC2 = min(base_low * (1 + zone_c_pct), base_low + atr_c * atr, close * 0.998, base_high)
+    if zA2 <= zA1: zA2 = min(base_low * 1.010, close * 0.995, base_high)
+    if zB2 <= zB1: zB2 = min(max(zB1, base_low * 1.020), close * 0.995, base_high)
+    if zC2 <= zC1: zC2 = min(max(zC1, base_low * 1.032), close * 0.998, base_high)
+
+    # Nếu vùng mua vẫn quá xa giá hiện tại, cấm báo mua.
+    distance_to_zone_pct = (close / zB2 - 1) * 100 if zB2 > 0 else np.nan
+    if np.isfinite(distance_to_zone_pct) and distance_to_zone_pct > max_action_pullback_pct:
+        zone_valid = False
+        practical_note = f"Vùng mua tính ra cách giá hiện tại {distance_to_zone_pct:.1f}%, vượt ngưỡng thực tế {max_action_pullback_pct:.1f}%. Chờ nền mới."
 
     stop_pct = float(cfg.get("vn_stop_pct", 2.2)) / 100.0
     stop_atr_mult = float(cfg.get("stop_atr_mult", 0.8))
     stop = min(base_low * (1 - stop_pct), base_low - stop_atr_mult * atr)
-    # Không để stop quá xa với chiến lược mua sớm. Cắt khi nền hỏng, không chịu lỗ sâu.
     max_stop_pct = float(cfg.get("vn_max_stop_pct", 5.0)) / 100.0
     stop = max(stop, base_low * (1 - max_stop_pct))
 
-    risk = (close/stop - 1)*100 if stop > 0 else np.nan
-    reward = (base_high/close - 1)*100 if close > 0 else np.nan
-    rr = reward/risk if risk and risk > 0 else np.nan
+    # R/R tính theo điểm mua giả định giữa vùng A/B, không phải theo giá hiện tại nếu giá đang xa vùng mua.
+    entry_ref = (zA1 + zB2) / 2 if zB2 > zA1 else min(close, zB2)
+    target = base_high
+    if target <= entry_ref:
+        target = max(recent_high, close * 1.035)
+    risk_from_entry = (entry_ref / stop - 1) * 100 if stop > 0 else np.nan
+    reward_from_entry = (target / entry_ref - 1) * 100 if entry_ref > 0 else np.nan
+    rr_entry = reward_from_entry / risk_from_entry if risk_from_entry and risk_from_entry > 0 else np.nan
+    risk_from_close = (close / stop - 1) * 100 if stop > 0 else np.nan
 
     # Relative strength vs market proxy
     rs20 = 0.0; alpha = 50.0
@@ -554,25 +645,38 @@ def analyze_one(t, g, market, cfg):
     close_pos = (last.close-last.low)/(last.high-last.low) if last.high > last.low else .5
     in_base = base_low <= close <= base_high*1.01
     low_part = close <= zB2
-    too_far = close > zC2 or close > base_low * (1 + float(cfg.get("vn_no_chase_pct", 6.0))/100.0)
-    tight = base_range_pct <= cfg["max_base_range_pct"] and in_base
-    shake = last.low < base_low*1.012 and close_pos > .55 and vol_ratio >= cfg["volume_spike"]
-    absorb = vol_ratio >= cfg["volume_spike"] and last.close >= last.open*.988 and in_base
-    dist = close > base_mid and vol_ratio >= 1.8 and close_pos < .35 and base.close.iloc[-1]/max(1e-9, base.close.iloc[0])-1 > .12
+    too_far = (not zone_valid) or close > zC2 or close > zB2 * (1 + no_chase_pct)
+    tight = base_range_pct <= cfg["max_base_range_pct"] and in_base and zone_model == "Nền gần hiện tại"
+    shake = zone_model == "Nền gần hiện tại" and last.low < base_low*1.012 and close_pos > .55 and vol_ratio >= cfg["volume_spike"]
+    absorb = zone_model == "Nền gần hiện tại" and vol_ratio >= cfg["volume_spike"] and last.close >= last.open*.988 and in_base
+    dist = close > base_mid and vol_ratio >= 1.8 and close_pos < .35 and raw_base.close.iloc[-1]/max(1e-9, raw_base.close.iloc[0])-1 > .12
+
     liq = 10 if val20 >= cfg["min_val"]*1e9 else 5 if val20 >= cfg["min_val"]*.5e9 else 0
-    base_score = 15 if tight else 8 if base_range_pct <= cfg["max_base_range_pct"] + 6 else 0
-    acc = (8 if absorb else 0) + (7 if shake else 0) + (5 if low_part else 0) + (5 if rs20 > 0 else 0)
-    no_chase = 10 if not too_far else 4
-    risk_score = 10 if risk <= 6 and rr >= 1.2 else 8 if risk <= 8 and rr >= 1.0 else 5 if risk <= 10 else 2
+    base_score = 15 if tight else 9 if zone_model == "Pullback gần trong trend" and zone_valid else 5 if base_range_pct <= cfg["max_base_range_pct"] + 6 else 0
+    acc = (8 if absorb else 0) + (7 if shake else 0) + (5 if low_part and zone_valid else 0) + (5 if rs20 > 0 else 0)
+    no_chase = 10 if zone_valid and not too_far else 2 if zone_model == "Không có vùng mua thực tế" else 4
+    risk_score = 10 if np.isfinite(risk_from_entry) and risk_from_entry <= 5.5 and np.isfinite(rr_entry) and rr_entry >= 1.25 else 8 if np.isfinite(risk_from_entry) and risk_from_entry <= 7 and np.isfinite(rr_entry) and rr_entry >= 1.0 else 4
     total = clamp(liq + base_score + acc + no_chase + risk_score + mf*1.2, 0, 100)
-    if dist: phase, sig = "Cảnh báo phân phối", "Distribution Warning"
-    elif shake: phase, sig = "Rũ cung trong nền", "Shakeout Buy Zone"
-    elif absorb: phase, sig = "Gom hàng trong nền", "Red Base Accumulation"
-    elif tight: phase, sig = "Tạo nền/siết nền", "Early Watch"
-    else: phase, sig = "Chưa rõ", "Watch only"
+
+    if dist:
+        phase, sig = "Cảnh báo phân phối", "Distribution Warning"
+    elif not zone_valid and old_base_far:
+        phase, sig = "Đã rời nền/không có điểm mua thực tế", "Wait New Base"
+    elif zone_model == "Pullback gần trong trend":
+        phase, sig = "Trend tăng - chờ pullback ngắn", "Trend Pullback Watch"
+    elif shake:
+        phase, sig = "Rũ cung trong nền", "Shakeout Buy Zone"
+    elif absorb:
+        phase, sig = "Gom hàng trong nền", "Red Base Accumulation"
+    elif tight:
+        phase, sig = "Tạo nền/siết nền", "Early Watch"
+    else:
+        phase, sig = "Chưa rõ", "Watch only"
 
     if dist:
         action = "TRÁNH MUA"
+    elif not zone_valid:
+        action = "KHÔNG THỰC TẾ - CHỜ NỀN MỚI/PULLBACK GẦN"
     elif mf < 8:
         action = "CHƯA ƯU TIÊN - DÒNG TIỀN YẾU"
     elif close <= zA2 and close >= stop:
@@ -582,37 +686,110 @@ def analyze_one(t, g, market, cfg):
     elif close <= zC2 and close >= stop:
         action = "VÙNG C - THẬN TRỌNG"
     elif too_far:
-        action = "KHÔNG ĐU XANH - CHỜ VỀ VÙNG"
+        action = "KHÔNG ĐU XANH - CHỜ VỀ VÙNG GẦN"
     else:
         action = "THEO DÕI - CHỜ RUNG LẮC"
 
-    conc = clamp(total*.42 + mf*1.9 + (8 if phase in ["Gom hàng trong nền","Rũ cung trong nền"] else 0) + (8 if close <= zB2 else 0) - (12 if dist else 0), 0, 100)
-    clabel = "CORE" if conc >= 78 and mf >= 15 and not dist else "WATCH" if conc >= 62 and mf >= 10 and not dist else "EARLY"
+    conc = clamp(total*.42 + mf*1.9 + (8 if phase in ["Gom hàng trong nền","Rũ cung trong nền","Trend tăng - chờ pullback ngắn"] else 0) + (8 if zone_valid and close <= zB2 else 0) - (20 if not zone_valid else 0) - (12 if dist else 0), 0, 100)
+    clabel = "CORE" if conc >= 78 and mf >= 15 and zone_valid and not dist else "WATCH" if conc >= 62 and mf >= 10 and not dist else "EARLY"
     victory = clamp(.29*conc + .25*mf*4 + .20*alpha + .16*no_chase*10 + .10*risk_score*10, 0, 100)
     vlabel = "ỨNG VIÊN VƯỢT THỊ TRƯỜNG MẠNH" if victory >= 80 else "ỨNG VIÊN TỐT" if victory >= 68 else "THEO DÕI" if victory >= 55 else "CHƯA ĐỦ CHUẨN"
-    why = [mf_state, phase, f"Biên nền {base_range_pct:.1f}%", f"ATR {atr_pct:.1f}%"]
-    if close <= zB2: why.append("Giá ở vùng mua đỏ")
+
+    # ========================================================
+    # V2.0 LATE CYCLE / MULTIBAGGER GUARD
+    # Cổ đã tăng quá xa như VIC tăng nhiều lần: không được đưa vào nhóm mua mới.
+    # Dòng tiền mạnh ở vùng cao có thể là phân phối, FOMO hoặc kéo giữ giá, không phải lợi thế mua đỏ.
+    # ========================================================
+    hard_return = float(cfg.get("late_hard_return_pct", 180.0))
+    hard_runup = float(cfg.get("late_hard_runup_pct", 260.0))
+    warn_return = float(cfg.get("late_warn_return_pct", 100.0))
+    warn_runup = float(cfg.get("late_warn_runup_pct", 150.0))
+    hard_ma_gap = float(cfg.get("late_hard_ma200_gap_pct", 85.0))
+    warn_ma_gap = float(cfg.get("late_warn_ma50_gap_pct", 28.0))
+    blowoff = (ret20 * 100 >= 35 and vol_ratio >= 1.5) or (ret60 * 100 >= 80)
+    late_cycle_hard_ban = bool((cycle_return_pct >= hard_return) or (runup_from_low_pct >= hard_runup) or (ema200_gap_pct >= hard_ma_gap) or blowoff)
+    late_cycle_warning = bool(late_cycle_hard_ban or cycle_return_pct >= warn_return or runup_from_low_pct >= warn_runup or ema50_gap_pct >= warn_ma_gap)
+    late_cycle_state = "Bình thường"
+    if late_cycle_hard_ban:
+        late_cycle_state = "CẤM MUA MỚI - cuối sóng/quá nóng"
+        zone_valid = False
+        phase = "Late-cycle/quá nóng"
+        sig = "Late Cycle Hard Ban"
+        action = "CẤM MUA - ĐÃ TĂNG QUÁ XA, CHỜ NỀN MỚI"
+        practical_note = (
+            f"Cổ đã tăng quá xa: tăng {cycle_return_pct:.1f}% trong {cycle_lookback} phiên, "
+            f"tăng {runup_from_low_pct:.1f}% từ đáy {cycle_lookback} phiên, cách EMA50 {ema50_gap_pct:.1f}%. "
+            "Không có lợi thế mua mới; chỉ xem lại khi tạo nền mới thực sự gần giá hiện tại."
+        )
+        conc = min(conc, 35)
+        victory = min(victory, 48)
+        clabel = "NO BUY"
+        vlabel = "RỦI RO CUỐI SÓNG"
+    elif late_cycle_warning and not new_base_mature:
+        late_cycle_state = "Cảnh báo muộn sóng - chưa có nền mới"
+        action = "KHÔNG MUA MỚI - CHỜ NỀN MỚI XÁC NHẬN"
+        phase = "Muộn sóng/chưa có nền mới"
+        sig = "Late Cycle Watch"
+        conc = min(conc, 58)
+        victory = min(victory, 62)
+        if clabel == "CORE":
+            clabel = "WATCH"
+        if "ỨNG VIÊN VƯỢT" in vlabel:
+            vlabel = "THEO DÕI RỦI RO"
+    elif late_cycle_warning and new_base_mature:
+        late_cycle_state = "Đã tăng mạnh nhưng có nền mới cần theo dõi"
+        if clabel == "CORE":
+            clabel = "WATCH"
+        action = "CHỈ THEO DÕI NỀN MỚI - KHÔNG ĐU XANH"
+
+    if zone_valid:
+        red_zone_text = frange(zA1, zB2)
+        buy_a_text = frange(zA1, zA2)
+        buy_b_text = frange(zB1, zB2)
+        buy_c_text = frange(zC1, zC2)
+        buy_trigger = f"Chỉ mua khi đỏ/rung lắc trong {red_zone_text}, ưu tiên vùng A/B; không đóng cửa dưới {fmt(stop)}"
+        no_buy_when = f"Không mua xanh; không mua nếu cách vùng mua đỏ > {max_action_pullback_pct:.1f}%; kháng cự gần {fmt(target)}"
+    else:
+        red_zone_text = "Chưa có vùng mua đỏ thực tế"
+        buy_a_text = buy_b_text = buy_c_text = "Chờ nền mới/pullback gần"
+        buy_trigger = practical_note or "Không mua hiện tại. Chờ cổ phiếu tạo nền mới hoặc pullback gần MA/ATR với volume cạn."
+        no_buy_when = f"Không mua đuổi. Nền cũ quá xa; vùng cũ {fmt(raw_base_low)}–{fmt(raw_base_high)} không còn dùng làm điểm mua."
+
+    invalidation = f"Đóng cửa dưới {fmt(stop)} hoặc thủng hỗ trợ {fmt(base_low)} với volume lớn" if zone_valid else "Chưa có điểm mua nên chưa có điểm cắt lỗ thực chiến; chỉ đặt stop sau khi có nền mới."
+    position_plan = "30% vùng A, thêm 20–30% nếu giữ nền/rũ cung; không trung bình giá xuống" if zone_valid else "Không giải ngân. Chờ nền mới 5–10 phiên hoặc pullback gần rồi quét lại."
+    why = [mf_state, phase, f"Mô hình vùng: {zone_model}", f"Biên vùng {base_range_pct:.1f}%", f"ATR {atr_pct:.1f}%"]
+    if zone_valid and close <= zB2: why.append("Giá ở vùng mua đỏ")
     if rs20 > 0: why.append("Mạnh hơn thị trường")
     if too_far: why.append("Giá xa vùng mua")
+    if not zone_valid: why.append("Loại vùng mua phi thực tế")
+    if late_cycle_warning: why.append(late_cycle_state)
     if dist: why.append("Cảnh báo phân phối")
+
     return {
         "ticker":t, "sector":g.sector.iloc[-1] if "sector" in g else SECTOR_MAP.get(t,"Khác"), "close":close,
         "phase":phase, "signal":sig, "action_decision":action, "Điểm tổng":round(total,1),
         "victory_score":round(victory,1), "victory_label":vlabel, "concentration_score":round(conc,1), "concentration_label":clabel,
         "money_flow_score":round(mf,1), "money_flow_state":mf_state, "value_ratio_5_20":round(vr5,2), "value_ratio_20_60":round(vr20,2),
         "up_value_ratio_pct":round(upv*100,1), "cmf20":round(cmf,3), "rs20_vs_market_pct":round(rs20*100,2),
-        "base_zone":frange(base_low,base_high), "base_range_pct":round(base_range_pct,2), "atr14_pct":round(atr_pct,2) if np.isfinite(atr_pct) else np.nan, "base_method":base_method,
-        "red_buy_zone":frange(zA1,zB2), "buy_zone_A":frange(zA1,zA2), "buy_zone_B":frange(zB1,zB2), "buy_zone_C":frange(zC1,zC2),
-        "stop_loss":fmt(stop), "target_near":fmt(base_high), "risk_pct_from_close":round(risk,2) if np.isfinite(risk) else np.nan,
-        "reward_pct_to_base_high":round(reward,2) if np.isfinite(reward) else np.nan, "rr_to_base_high":round(rr,2) if np.isfinite(rr) else np.nan,
-        "no_buy_when":f"Không mua xanh/sát kháng cự {fmt(base_high)}; vùng mua đỏ hẹp {frange(zA1,zB2)}",
-        "buy_trigger":f"Chỉ mua khi đỏ/rung lắc trong {frange(zA1,zB2)}, ưu tiên vùng A/B; không đóng cửa dưới {fmt(stop)}",
-        "invalidation":f"Đóng cửa dưới {fmt(stop)} hoặc thủng hỗ trợ {fmt(base_low)} với volume lớn",
-        "position_plan":"30% vùng A, thêm 20–30% nếu giữ nền/rũ cung; không trung bình giá xuống",
+        "zone_model":zone_model, "zone_valid":zone_valid, "distance_to_buy_zone_pct":round(distance_to_zone_pct,2) if np.isfinite(distance_to_zone_pct) else np.nan,
+        "base_zone":frange(base_low,base_high), "old_base_zone":frange(raw_base_low,raw_base_high), "base_range_pct":round(base_range_pct,2), "atr14_pct":round(atr_pct,2) if np.isfinite(atr_pct) else np.nan, "base_method":base_method,
+        "red_buy_zone":red_zone_text, "buy_zone_A":buy_a_text, "buy_zone_B":buy_b_text, "buy_zone_C":buy_c_text,
+        "stop_loss":fmt(stop) if zone_valid else "Chờ nền mới", "target_near":fmt(target), "risk_pct_from_close":round(risk_from_close,2) if np.isfinite(risk_from_close) else np.nan,
+        "risk_pct_from_buy_zone":round(risk_from_entry,2) if np.isfinite(risk_from_entry) else np.nan,
+        "reward_pct_from_buy_zone":round(reward_from_entry,2) if np.isfinite(reward_from_entry) else np.nan,
+        "reward_pct_to_base_high":round(reward_from_entry,2) if np.isfinite(reward_from_entry) else np.nan, "rr_to_base_high":round(rr_entry,2) if np.isfinite(rr_entry) else np.nan,
+        "no_buy_when":no_buy_when,
+        "buy_trigger":buy_trigger,
+        "invalidation":invalidation,
+        "position_plan":position_plan,
         "why_focus":" | ".join(why), "distribution_warning":dist,
-        "_base_low":base_low, "_base_high":base_high, "_red_high":zB2, "_stop":stop,
+        "late_cycle_warning":late_cycle_warning, "late_cycle_hard_ban":late_cycle_hard_ban, "late_cycle_state":late_cycle_state,
+        "cycle_return_pct":round(cycle_return_pct,1), "runup_from_low_pct":round(runup_from_low_pct,1),
+        "ema50_gap_pct":round(ema50_gap_pct,1), "ema200_gap_pct":round(ema200_gap_pct,1),
+        "new_base_range_pct":round(new_base_range_pct,1) if np.isfinite(new_base_range_pct) else np.nan,
+        "new_base_mature":new_base_mature,
+        "_base_low":base_low, "_base_high":target, "_red_high":zB2, "_stop":stop,
     }
-
 
 def analyze_prices(prices, market, cfg):
     rows, details, errors = [], {}, []
@@ -644,6 +821,8 @@ def focus_df(res, macro, n):
         r["action_decision"] = "CHỜ THỊ TRƯỜNG - VĨ MÔ XẤU"; r["concentration_score"] *= .72
     elif mode == "Small":
         r.loc[r.action_decision.str.contains("CÓ THỂ|CHỈ", regex=True), "action_decision"] = "CHỈ THĂM DÒ NHỎ - CHỜ THIÊN THỜI"; r["concentration_score"] *= .86
+    if "late_cycle_hard_ban" in r.columns:
+        r = r[~r["late_cycle_hard_ban"]]
     c = r[~r.distribution_warning].sort_values(["victory_score","concentration_score","money_flow_score","rr_to_base_high"], ascending=False)
     cols = ["ticker","sector","concentration_label","concentration_score","victory_score","victory_label","money_flow_score","money_flow_state","action_decision","phase","close","red_buy_zone","stop_loss","rr_to_base_high","why_focus"]
     return c.head(n)[cols]
@@ -660,10 +839,10 @@ def chart(g,row):
 # ============================================================
 # UI
 # ============================================================
-st.title("Smart Money Red Base Scanner – VN Volatility Calibration MVP V1.8")
+st.title("Smart Money Red Base Scanner – Late Cycle Guard MVP V2.0")
 st.caption("App sống theo thị trường: tự làm mới dữ liệu, theo dõi vĩ mô toàn cầu, tin tức cuối tuần và chỉ mở tín hiệu mua khi thiên thời không xấu.")
 with st.expander("Triết lý hệ thống"):
-    st.write("Không mua xanh/đu break. Ưu tiên cổ phiếu có dòng tiền, ngành có tiền, vĩ mô không xấu, giá ở vùng đỏ trong nền. Bản V1.8 hiệu chỉnh biên mua theo cổ phiếu Việt Nam: nền dùng quantile để bỏ outlier, vùng mua đỏ hẹp theo ATR/% giá, cắt lỗ sát nền, tránh vùng mua quá rộng.")
+    st.write("Không mua xanh/đu break. Ưu tiên cổ phiếu có dòng tiền, ngành có tiền, vĩ mô không xấu, giá ở vùng đỏ trong nền. Bản V2.0 sửa điểm chí mạng: không được nhầm dòng tiền vào ở cuối sóng với cơ hội mua. Cổ phiếu đã tăng quá xa/nhân nhiều lần trong 6–12 tháng sẽ bị chặn mua mới, dù dòng tiền còn mạnh. App chỉ theo dõi lại khi tạo nền mới thực sự gần giá hiện tại.")
 
 with st.sidebar:
     st.header("0) Live Pulse")
@@ -714,6 +893,14 @@ with st.sidebar:
     vn_red_zone_pct = st.slider("Độ rộng tối đa vùng mua đỏ (%)", 2.0, 8.0, 4.5, step=0.5)
     vn_stop_pct = st.slider("Cắt lỗ dưới hỗ trợ nền (%)", 1.0, 5.0, 2.2, step=0.2)
     vn_no_chase_pct = st.slider("Không mua nếu cách hỗ trợ quá (%)", 4.0, 12.0, 6.0, step=0.5)
+    max_action_pullback_pct = st.slider("Vùng mua thực tế tối đa cách giá hiện tại (%)", 3.0, 12.0, 7.0, step=0.5)
+    st.caption("V1.9: Nếu vùng mua tính ra thấp hơn ngưỡng này, app sẽ coi là không thực tế và chuyển sang CHỜ NỀN MỚI/PULLBACK GẦN.")
+    st.header("2B) Chặn cổ phiếu quá nóng/cuối sóng")
+    late_hard_return_pct = st.slider("Cấm mua nếu tăng 6–12 tháng vượt (%)", 80, 500, 180, step=10)
+    late_hard_runup_pct = st.slider("Cấm mua nếu tăng từ đáy 6–12 tháng vượt (%)", 120, 900, 260, step=20)
+    late_warn_return_pct = st.slider("Cảnh báo muộn sóng nếu tăng vượt (%)", 50, 300, 100, step=10)
+    late_new_base_max_pct = st.slider("Nền mới sau siêu tăng tối đa rộng (%)", 6, 18, 10, step=1)
+    st.caption("V2.0: cổ đã tăng nhiều lần như VIC sẽ bị chặn mua mới. Chỉ theo dõi lại nếu tạo nền mới hẹp đủ lâu gần giá hiện tại.")
     focus_n = st.slider("Số mã cô đặc cuối", 2, 5, 3)
     st.header("3) Thiên thời")
     enable_macro = st.checkbox("Bật Macro Timing Gate", value=True)
@@ -754,11 +941,11 @@ if show_news_pulse:
             st.success("News Shock thấp. Không thấy cụm tin xấu nổi bật trong RSS hiện tại.")
 
 if not run:
-    st.info("Bấm nút quét để bắt đầu. Bản V1.8 đã siết vùng mua đỏ theo biên dao động cổ phiếu Việt Nam.")
+    st.info("Bấm nút quét để bắt đầu. Bản V2.0 có Late Cycle Guard: cổ đã tăng quá xa/nhân nhiều lần sẽ bị chặn mua mới, không nhầm dòng tiền cuối sóng với cơ hội mua.")
     st.stop()
 
 tickers = parse_tickers(ticker_text)
-cfg = {"min_val":min_val, "base_window":base_window, "volume_spike":volume_spike, "max_base_range_pct":max_base, "vn_base_cap_pct":vn_base_cap_pct, "vn_red_zone_pct":vn_red_zone_pct, "vn_stop_pct":vn_stop_pct, "vn_no_chase_pct":vn_no_chase_pct}
+cfg = {"min_val":min_val, "base_window":base_window, "volume_spike":volume_spike, "max_base_range_pct":max_base, "vn_base_cap_pct":vn_base_cap_pct, "vn_red_zone_pct":vn_red_zone_pct, "vn_stop_pct":vn_stop_pct, "vn_no_chase_pct":vn_no_chase_pct, "max_action_pullback_pct":max_action_pullback_pct, "late_hard_return_pct":late_hard_return_pct, "late_hard_runup_pct":late_hard_runup_pct, "late_warn_return_pct":late_warn_return_pct, "late_warn_runup_pct":150.0, "late_hard_ma200_gap_pct":85.0, "late_warn_ma50_gap_pct":28.0, "late_new_base_max_pct":late_new_base_max_pct}
 errors = []
 
 if data_mode == "Demo":
@@ -884,7 +1071,7 @@ st.dataframe(focus, use_container_width=True, hide_index=True, column_config={
 })
 
 st.subheader("5) Bảng hành động thực chiến")
-cols = ["ticker","sector","victory_score","victory_label","concentration_label","concentration_score","money_flow_score","money_flow_state","phase","signal","action_decision","close","base_zone","base_range_pct","atr14_pct","red_buy_zone","buy_zone_A","buy_zone_B","buy_zone_C","stop_loss","target_near","risk_pct_from_close","reward_pct_to_base_high","rr_to_base_high","rs20_vs_market_pct","base_method","why_focus"]
+cols = ["ticker","sector","victory_score","victory_label","concentration_label","concentration_score","money_flow_score","money_flow_state","late_cycle_state","cycle_return_pct","runup_from_low_pct","ema50_gap_pct","ema200_gap_pct","new_base_mature","phase","signal","action_decision","close","zone_model","zone_valid","distance_to_buy_zone_pct","base_zone","old_base_zone","base_range_pct","atr14_pct","red_buy_zone","buy_zone_A","buy_zone_B","buy_zone_C","stop_loss","target_near","risk_pct_from_buy_zone","reward_pct_from_buy_zone","rr_to_base_high","rs20_vs_market_pct","base_method","why_focus"]
 st.dataframe(res.sort_values(["victory_score","concentration_score"], ascending=False)[cols], use_container_width=True, hide_index=True, column_config={
     "victory_score": st.column_config.ProgressColumn("Điểm thắng TT", min_value=0, max_value=100, format="%.1f"),
     "concentration_score": st.column_config.ProgressColumn("Điểm cô đặc", min_value=0, max_value=100, format="%.1f"),
@@ -901,12 +1088,13 @@ c1,c2,c3,c4 = st.columns(4)
 c1.metric("Giá hiện tại", fmt(r.close))
 c2.metric("Vùng mua đỏ", r.red_buy_zone)
 c3.metric("Cắt lỗ", r.stop_loss)
-c4.metric("R/R tới đỉnh nền", r.rr_to_base_high)
+c4.metric("R/R từ vùng mua", r.rr_to_base_high)
 st.markdown(f"""
 ### {sel} — {r.victory_label}
 - **Quyết định:** {r.action_decision}
 - **Pha:** {r.phase}
 - **Dòng tiền:** {r.money_flow_state} ({r.money_flow_score}/25)
+- **Bộ lọc cuối sóng:** {r.late_cycle_state} | Tăng chu kỳ: {r.cycle_return_pct}% | Tăng từ đáy: {r.runup_from_low_pct}% | Cách EMA50: {r.ema50_gap_pct}%
 - **Điều kiện mua:** {r.buy_trigger}
 - **Không mua khi:** {r.no_buy_when}
 - **Điều kiện vô hiệu:** {r.invalidation}
@@ -916,4 +1104,4 @@ st.markdown(f"""
 
 st.subheader("7) Tải kết quả")
 csv = res.sort_values(["victory_score","concentration_score"], ascending=False).to_csv(index=False).encode("utf-8-sig")
-st.download_button("Tải CSV", data=csv, file_name="market_winner_v17_live_pulse_results.csv", mime="text/csv")
+st.download_button("Tải CSV", data=csv, file_name="market_winner_v20_late_cycle_guard_results.csv", mime="text/csv")
