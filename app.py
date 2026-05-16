@@ -1,5 +1,5 @@
 """
-Smart Money Red Base Scanner - MVP V0.4
+Smart Money Red Base Scanner - MVP V1.0 Yahoo Direct
 Author: ChatGPT
 Purpose: Scan Vietnamese stock candidates using an early-accumulation, red-base buying style.
 
@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import io
 import math
+import json
+import time
+import urllib.parse
+import urllib.request
 from datetime import date, timedelta
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -273,9 +277,80 @@ def fetch_history_vnstock(symbol: str, start: str, end: str, source: str = "VCI"
     raise RuntimeError("; ".join(errors[-2:]) if errors else "Không lấy được dữ liệu")
 
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_history_yahoo_chart(symbol: str, start: str, end: str, is_index: bool = False) -> pd.DataFrame:
+    """Fetch OHLCV directly from Yahoo Chart API without yfinance.
+
+    This is often more stable on Streamlit Cloud than yfinance.download().
+    It tries Vietnamese stock suffixes used by Yahoo Finance, for example HPG.VN.
+    """
+    start_ts = int(pd.Timestamp(start).timestamp())
+    end_ts = int(pd.Timestamp(end).timestamp())
+    if end_ts <= start_ts:
+        end_ts = start_ts + 86400
+
+    if is_index:
+        candidates = ["^VNINDEX", "VNINDEX.VN", symbol]
+    else:
+        candidates = [f"{symbol}.VN", f"{symbol}.HN", symbol]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+    }
+    last_error = None
+    for ysym in candidates:
+        encoded = urllib.parse.quote(ysym, safe="")
+        url = (
+            f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}"
+            f"?period1={start_ts}&period2={end_ts}&interval=1d&events=history&includeAdjustedClose=true"
+        )
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                raw = resp.read().decode("utf-8")
+            payload = json.loads(raw)
+            result = payload.get("chart", {}).get("result")
+            if not result:
+                err = payload.get("chart", {}).get("error")
+                last_error = err or "empty result"
+                continue
+            item = result[0]
+            timestamps = item.get("timestamp") or []
+            quote = (item.get("indicators", {}).get("quote") or [{}])[0]
+            if not timestamps or not quote:
+                last_error = "no timestamps/quote"
+                continue
+            df = pd.DataFrame({
+                "date": pd.to_datetime(timestamps, unit="s").date,
+                "open": quote.get("open"),
+                "high": quote.get("high"),
+                "low": quote.get("low"),
+                "close": quote.get("close"),
+                "volume": quote.get("volume"),
+            })
+            df = df.dropna(subset=["open", "high", "low", "close"])
+            if df.empty:
+                last_error = "empty normalized dataframe"
+                continue
+            df["ticker"] = symbol.upper()
+            df["value"] = pd.to_numeric(df["close"], errors="coerce") * pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+            return normalize_external_history(df, symbol, is_index=is_index)
+        except Exception as e:
+            last_error = e
+            time.sleep(0.1)
+            continue
+    raise RuntimeError(f"Yahoo Chart API không trả dữ liệu cho {symbol}. Lỗi cuối: {last_error}")
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def fetch_history_yfinance(symbol: str, start: str, end: str, is_index: bool = False) -> pd.DataFrame:
-    """Fallback via Yahoo Finance. Tries .VN and .HN suffix for equities."""
+    """Yahoo fallback. Try direct Chart API first, then yfinance.download()."""
+    try:
+        return fetch_history_yahoo_chart(symbol, start, end, is_index=is_index)
+    except Exception as direct_error:
+        pass
+
     try:
         import yfinance as yf  # type: ignore
     except Exception as e:
@@ -1050,8 +1125,8 @@ def make_candlestick_chart(tg: pd.DataFrame, detail: Dict) -> go.Figure:
 # -----------------------------
 def main():
     st.set_page_config(page_title="Smart Money Red Base Scanner", layout="wide")
-    st.title("Smart Money Red Base Scanner – Auto Data MVP V0.9 Fast Safe")
-    st.caption("Tự tải dữ liệu thị trường, quét dấu hiệu tay to gom hàng, ưu tiên mua đỏ trong nền. Bản V0.9 chống treo: mặc định Yahoo nhanh, có nút chạy quét, giới hạn ít mã, bỏ qua nguồn dữ liệu chậm.")
+    st.title("Smart Money Red Base Scanner – Auto Data MVP V1.0 Yahoo Direct")
+    st.caption("Tự tải dữ liệu thị trường, quét dấu hiệu tay to gom hàng, ưu tiên mua đỏ trong nền. Bản V1.0: ưu tiên Yahoo Chart API trực tiếp, có nút chạy quét, giới hạn ít mã, bỏ qua nguồn dữ liệu chậm.")
 
     with st.expander("Triết lý hệ thống", expanded=False):
         st.markdown(
@@ -1063,7 +1138,7 @@ def main():
         )
 
     st.sidebar.header("1) Dữ liệu tự động")
-    st.sidebar.info("Bản chống treo: chạy 5–10 mã và 120–180 ngày trước. Nguồn mặc định là Yahoo để tránh Vnstock bị treo trên cloud.")
+    st.sidebar.info("Bản chống treo: chạy 5–10 mã và 120–180 ngày trước. Nguồn mặc định là Yahoo Direct để tránh Vnstock/yfinance bị treo trên cloud.")
     data_mode = st.sidebar.radio(
         "Chọn nguồn dữ liệu",
         ["Tự động: Yahoo", "Tự động: Vnstock → Yahoo fallback", "Tự động: Vnstock", "Upload thủ công", "Demo"],
