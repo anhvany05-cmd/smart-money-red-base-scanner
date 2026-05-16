@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Market Winner Scanner V1.7 Live Pulse", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Market Winner Scanner V1.8 VN Volatility", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # UNIVERSE
@@ -438,18 +438,87 @@ def macro_gate(end_date, days, market):
     return {"macro_score":round(score,1), "macro_gate":gate, "risk_mode":mode, "notes":notes[:6], "errors":errs[:20]}
 
 
+def choose_vn_base(d: pd.DataFrame, cfg: Dict) -> Tuple[pd.DataFrame, float, float, float, str]:
+    """Chọn nền phù hợp biên dao động cổ phiếu Việt Nam.
+
+    Không dùng min-low/max-high của 60 phiên vì sẽ làm nền quá rộng khi có một nhịp rũ hoặc đỉnh cũ xa.
+    Cách mới: thử nhiều cửa sổ gần nhất, dùng quantile để bỏ outlier, ưu tiên nền có close hiện tại nằm trong/ gần nền.
+    """
+    windows = [20, 25, 30, 35, 45, 60]
+    max_w = int(cfg.get("base_window", 45))
+    windows = [w for w in windows if w <= max_w and len(d) >= w]
+    if not windows:
+        w = min(len(d), max(20, len(d)))
+        windows = [w]
+    close = float(d.close.iloc[-1])
+    best = None
+    cap_pct = float(cfg.get("vn_base_cap_pct", 16.0))
+    for w in windows:
+        b = d.tail(w).copy()
+        raw_low = float(b.low.min())
+        raw_high = float(b.high.max())
+        # Quantile nền: bỏ các đuôi quá cực đoan để tránh nền bị rộng kiểu 36k-70k.
+        q_low = float(b.low.quantile(0.12))
+        q_high = float(b.high.quantile(0.88))
+        close_low = float(b.close.quantile(0.10))
+        close_high = float(b.close.quantile(0.90))
+        base_low = min(q_low, close_low)
+        base_high = max(q_high, close_high)
+        if base_low <= 0:
+            continue
+        # Nếu vẫn quá rộng, cắt về vùng hỗ trợ gần + trần nền hợp lý cho cổ phiếu VN.
+        base_high = min(base_high, base_low * (1 + cap_pct / 100.0))
+        rng = (base_high / base_low - 1) * 100 if base_low > 0 else 999
+        in_or_near = base_low * 0.985 <= close <= base_high * 1.035
+        # Ưu tiên nền hẹp, gần giá hiện tại, cửa sổ không quá ngắn.
+        score = rng + (0 if in_or_near else 12) + abs(w-35)*0.06
+        if best is None or score < best[0]:
+            best = (score, b, base_low, base_high, rng, f"{w} phiên, quantile 12–88%, cap {cap_pct:.0f}%")
+    if best is None:
+        b = d.tail(min(35, len(d))).copy()
+        base_low = float(b.low.tail(20).min())
+        base_high = float(b.high.tail(20).max())
+        rng = (base_high / base_low - 1) * 100 if base_low > 0 else 999
+        return b, base_low, base_high, rng, "fallback"
+    _, b, base_low, base_high, rng, method = best
+    return b, float(base_low), float(base_high), float(rng), method
+
+
 def analyze_one(t, g, market, cfg):
     d = enrich(g); last = d.iloc[-1]
-    bw = int(min(cfg["base_window"], max(30, len(d)-5)))
-    base = d.tail(bw)
-    close = float(last.close); base_low = float(base.low.min()); base_high = float(base.high.max())
+    base, base_low, base_high, base_range_pct, base_method = choose_vn_base(d, cfg)
+    close = float(last.close)
     base_mid = (base_low + base_high) / 2
-    atr = float(last.atr14) if np.isfinite(last.atr14) and last.atr14 > 0 else max(close * 0.025, (base_high-base_low)/10)
-    base_range_pct = (base_high/base_low - 1) * 100 if base_low > 0 else 999
-    zA1 = base_low; zA2 = base_low + .18*(base_high-base_low)
-    zB1 = zA2; zB2 = base_low + .33*(base_high-base_low)
-    zC1 = zB2; zC2 = base_low + .45*(base_high-base_low)
-    stop = min(base_low - .5*atr, base_low * .985)
+    atr = float(last.atr14) if np.isfinite(last.atr14) and last.atr14 > 0 else max(close * 0.018, (base_high-base_low)/8)
+    atr_pct = atr / close * 100 if close > 0 else np.nan
+
+    # ========================================================
+    # VN RED BUY ZONE ENGINE
+    # Cổ phiếu VN thường đi lên chậm, giảm nhanh; biên 1 phiên không lớn.
+    # Vì vậy vùng mua đỏ phải hẹp quanh hỗ trợ, không lấy 1/3 toàn bộ nền.
+    # ========================================================
+    max_buy_pct = float(cfg.get("vn_red_zone_pct", 4.5)) / 100.0
+    zone_a_pct = float(cfg.get("zone_a_pct", 1.8)) / 100.0
+    zone_b_pct = float(cfg.get("zone_b_pct", 3.2)) / 100.0
+    zone_c_pct = float(cfg.get("zone_c_pct", 4.8)) / 100.0
+
+    zA1 = base_low
+    zA2 = min(base_low * (1 + zone_a_pct), base_low + 0.9 * atr)
+    zB1 = zA2
+    zB2 = min(base_low * (1 + zone_b_pct), base_low + 1.6 * atr, base_low * (1 + max_buy_pct), base_high)
+    zC1 = zB2
+    zC2 = min(base_low * (1 + zone_c_pct), base_low + 2.4 * atr, base_high)
+    if zA2 <= zA1: zA2 = min(base_low * 1.018, base_high)
+    if zB2 <= zB1: zB2 = min(base_low * 1.032, base_high)
+    if zC2 <= zC1: zC2 = min(base_low * 1.048, base_high)
+
+    stop_pct = float(cfg.get("vn_stop_pct", 2.2)) / 100.0
+    stop_atr_mult = float(cfg.get("stop_atr_mult", 0.8))
+    stop = min(base_low * (1 - stop_pct), base_low - stop_atr_mult * atr)
+    # Không để stop quá xa với chiến lược mua sớm. Cắt khi nền hỏng, không chịu lỗ sâu.
+    max_stop_pct = float(cfg.get("vn_max_stop_pct", 5.0)) / 100.0
+    stop = max(stop, base_low * (1 - max_stop_pct))
+
     risk = (close/stop - 1)*100 if stop > 0 else np.nan
     reward = (base_high/close - 1)*100 if close > 0 else np.nan
     rr = reward/risk if risk and risk > 0 else np.nan
@@ -484,29 +553,44 @@ def analyze_one(t, g, market, cfg):
     vol_ratio = float(last.volume/vol20) if vol20 > 0 else 1
     close_pos = (last.close-last.low)/(last.high-last.low) if last.high > last.low else .5
     in_base = base_low <= close <= base_high*1.01
-    low_part = close <= base_low + .4*(base_high-base_low)
-    too_far = close > base_low + .65*(base_high-base_low)
+    low_part = close <= zB2
+    too_far = close > zC2 or close > base_low * (1 + float(cfg.get("vn_no_chase_pct", 6.0))/100.0)
     tight = base_range_pct <= cfg["max_base_range_pct"] and in_base
-    shake = last.low < base_low*1.01 and close_pos > .55 and vol_ratio >= cfg["volume_spike"]
-    absorb = vol_ratio >= cfg["volume_spike"] and last.close >= last.open*.985 and in_base
-    dist = close > base_mid and vol_ratio >= 1.8 and close_pos < .35 and base.close.iloc[-1]/base.close.iloc[0]-1 > .12
+    shake = last.low < base_low*1.012 and close_pos > .55 and vol_ratio >= cfg["volume_spike"]
+    absorb = vol_ratio >= cfg["volume_spike"] and last.close >= last.open*.988 and in_base
+    dist = close > base_mid and vol_ratio >= 1.8 and close_pos < .35 and base.close.iloc[-1]/max(1e-9, base.close.iloc[0])-1 > .12
     liq = 10 if val20 >= cfg["min_val"]*1e9 else 5 if val20 >= cfg["min_val"]*.5e9 else 0
-    base_score = 15 if tight else 8 if base_range_pct <= cfg["max_base_range_pct"] + 10 else 0
+    base_score = 15 if tight else 8 if base_range_pct <= cfg["max_base_range_pct"] + 6 else 0
     acc = (8 if absorb else 0) + (7 if shake else 0) + (5 if low_part else 0) + (5 if rs20 > 0 else 0)
     no_chase = 10 if not too_far else 4
-    risk_score = 10 if risk <= 8 and rr >= 1.4 else 6 if risk <= 10 else 2
+    risk_score = 10 if risk <= 6 and rr >= 1.2 else 8 if risk <= 8 and rr >= 1.0 else 5 if risk <= 10 else 2
     total = clamp(liq + base_score + acc + no_chase + risk_score + mf*1.2, 0, 100)
     if dist: phase, sig = "Cảnh báo phân phối", "Distribution Warning"
     elif shake: phase, sig = "Rũ cung trong nền", "Shakeout Buy Zone"
     elif absorb: phase, sig = "Gom hàng trong nền", "Red Base Accumulation"
     elif tight: phase, sig = "Tạo nền/siết nền", "Early Watch"
     else: phase, sig = "Chưa rõ", "Watch only"
-    action = "TRÁNH MUA" if dist else "CHƯA ƯU TIÊN - DÒNG TIỀN YẾU" if mf < 8 else "CÓ THỂ CANH MUA ĐỎ" if close <= zB2 and close >= stop else "CHỈ THĂM DÒ NHỎ" if close <= zC2 else "KHÔNG ĐU XANH - CHỜ VỀ VÙNG" if too_far else "THEO DÕI - CHỜ RUNG LẮC"
-    conc = clamp(total*.42 + mf*1.9 + (8 if phase in ["Gom hàng trong nền","Rũ cung trong nền"] else 0) + (6 if close <= zB2 else 0) - (10 if dist else 0), 0, 100)
+
+    if dist:
+        action = "TRÁNH MUA"
+    elif mf < 8:
+        action = "CHƯA ƯU TIÊN - DÒNG TIỀN YẾU"
+    elif close <= zA2 and close >= stop:
+        action = "VÙNG A - CÓ THỂ CANH MUA ĐỎ"
+    elif close <= zB2 and close >= stop:
+        action = "VÙNG B - CHỈ THĂM DÒ"
+    elif close <= zC2 and close >= stop:
+        action = "VÙNG C - THẬN TRỌNG"
+    elif too_far:
+        action = "KHÔNG ĐU XANH - CHỜ VỀ VÙNG"
+    else:
+        action = "THEO DÕI - CHỜ RUNG LẮC"
+
+    conc = clamp(total*.42 + mf*1.9 + (8 if phase in ["Gom hàng trong nền","Rũ cung trong nền"] else 0) + (8 if close <= zB2 else 0) - (12 if dist else 0), 0, 100)
     clabel = "CORE" if conc >= 78 and mf >= 15 and not dist else "WATCH" if conc >= 62 and mf >= 10 and not dist else "EARLY"
     victory = clamp(.29*conc + .25*mf*4 + .20*alpha + .16*no_chase*10 + .10*risk_score*10, 0, 100)
     vlabel = "ỨNG VIÊN VƯỢT THỊ TRƯỜNG MẠNH" if victory >= 80 else "ỨNG VIÊN TỐT" if victory >= 68 else "THEO DÕI" if victory >= 55 else "CHƯA ĐỦ CHUẨN"
-    why = [mf_state, phase]
+    why = [mf_state, phase, f"Biên nền {base_range_pct:.1f}%", f"ATR {atr_pct:.1f}%"]
     if close <= zB2: why.append("Giá ở vùng mua đỏ")
     if rs20 > 0: why.append("Mạnh hơn thị trường")
     if too_far: why.append("Giá xa vùng mua")
@@ -517,12 +601,13 @@ def analyze_one(t, g, market, cfg):
         "victory_score":round(victory,1), "victory_label":vlabel, "concentration_score":round(conc,1), "concentration_label":clabel,
         "money_flow_score":round(mf,1), "money_flow_state":mf_state, "value_ratio_5_20":round(vr5,2), "value_ratio_20_60":round(vr20,2),
         "up_value_ratio_pct":round(upv*100,1), "cmf20":round(cmf,3), "rs20_vs_market_pct":round(rs20*100,2),
-        "base_zone":frange(base_low,base_high), "red_buy_zone":frange(zA1,zB2), "buy_zone_A":frange(zA1,zA2), "buy_zone_B":frange(zB1,zB2), "buy_zone_C":frange(zC1,zC2),
+        "base_zone":frange(base_low,base_high), "base_range_pct":round(base_range_pct,2), "atr14_pct":round(atr_pct,2) if np.isfinite(atr_pct) else np.nan, "base_method":base_method,
+        "red_buy_zone":frange(zA1,zB2), "buy_zone_A":frange(zA1,zA2), "buy_zone_B":frange(zB1,zB2), "buy_zone_C":frange(zC1,zC2),
         "stop_loss":fmt(stop), "target_near":fmt(base_high), "risk_pct_from_close":round(risk,2) if np.isfinite(risk) else np.nan,
         "reward_pct_to_base_high":round(reward,2) if np.isfinite(reward) else np.nan, "rr_to_base_high":round(rr,2) if np.isfinite(rr) else np.nan,
-        "no_buy_when":f"Không mua xanh/sát kháng cự {fmt(base_high)}; chờ về {frange(zA1,zB2)}",
-        "buy_trigger":f"Chỉ mua khi đỏ/rung lắc trong {frange(zA1,zB2)}, không đóng cửa dưới {fmt(stop)}",
-        "invalidation":f"Đóng cửa dưới {fmt(stop)} hoặc thủng nền với volume lớn",
+        "no_buy_when":f"Không mua xanh/sát kháng cự {fmt(base_high)}; vùng mua đỏ hẹp {frange(zA1,zB2)}",
+        "buy_trigger":f"Chỉ mua khi đỏ/rung lắc trong {frange(zA1,zB2)}, ưu tiên vùng A/B; không đóng cửa dưới {fmt(stop)}",
+        "invalidation":f"Đóng cửa dưới {fmt(stop)} hoặc thủng hỗ trợ {fmt(base_low)} với volume lớn",
         "position_plan":"30% vùng A, thêm 20–30% nếu giữ nền/rũ cung; không trung bình giá xuống",
         "why_focus":" | ".join(why), "distribution_warning":dist,
         "_base_low":base_low, "_base_high":base_high, "_red_high":zB2, "_stop":stop,
@@ -575,10 +660,10 @@ def chart(g,row):
 # ============================================================
 # UI
 # ============================================================
-st.title("Smart Money Red Base Scanner – Live Pulse MVP V1.7")
+st.title("Smart Money Red Base Scanner – VN Volatility Calibration MVP V1.8")
 st.caption("App sống theo thị trường: tự làm mới dữ liệu, theo dõi vĩ mô toàn cầu, tin tức cuối tuần và chỉ mở tín hiệu mua khi thiên thời không xấu.")
 with st.expander("Triết lý hệ thống"):
-    st.write("Không mua xanh/đu break. Ưu tiên cổ phiếu có dòng tiền, ngành có tiền, vĩ mô không xấu, giá ở vùng đỏ trong nền. Bản V1.7 thêm Live Pulse: tự refresh, theo dõi macro intraday và tin tức vĩ mô nóng kể cả cuối tuần.")
+    st.write("Không mua xanh/đu break. Ưu tiên cổ phiếu có dòng tiền, ngành có tiền, vĩ mô không xấu, giá ở vùng đỏ trong nền. Bản V1.8 hiệu chỉnh biên mua theo cổ phiếu Việt Nam: nền dùng quantile để bỏ outlier, vùng mua đỏ hẹp theo ATR/% giá, cắt lỗ sát nền, tránh vùng mua quá rộng.")
 
 with st.sidebar:
     st.header("0) Live Pulse")
@@ -621,9 +706,14 @@ with st.sidebar:
     run = st.button("🚀 Quét đãi cát tìm vàng", type="primary", use_container_width=True)
     st.header("2) Cấu hình lọc")
     min_val = st.number_input("GTGD bình quân 20 phiên tối thiểu (tỷ VND)", value=5.0, min_value=0.0, step=1.0)
-    base_window = st.slider("Số phiên xác định nền", 30, 90, 60, step=5)
+    base_window = st.slider("Số phiên xác định nền", 20, 75, 45, step=5)
     volume_spike = st.slider("Ngưỡng volume bất thường", 1.1, 3.0, 1.5, step=.1)
-    max_base = st.slider("Biên độ nền tối đa (%)", 10, 45, 28, step=1)
+    max_base = st.slider("Biên độ nền tối đa (%)", 6, 25, 14, step=1)
+    st.caption("V1.8: biên nền mặc định 14% để hợp hơn với cổ phiếu Việt Nam; nền quá rộng sẽ bị hạ điểm.")
+    vn_base_cap_pct = st.slider("Trần biên nền dùng để tính vùng mua (%)", 8, 24, 16, step=1)
+    vn_red_zone_pct = st.slider("Độ rộng tối đa vùng mua đỏ (%)", 2.0, 8.0, 4.5, step=0.5)
+    vn_stop_pct = st.slider("Cắt lỗ dưới hỗ trợ nền (%)", 1.0, 5.0, 2.2, step=0.2)
+    vn_no_chase_pct = st.slider("Không mua nếu cách hỗ trợ quá (%)", 4.0, 12.0, 6.0, step=0.5)
     focus_n = st.slider("Số mã cô đặc cuối", 2, 5, 3)
     st.header("3) Thiên thời")
     enable_macro = st.checkbox("Bật Macro Timing Gate", value=True)
@@ -664,11 +754,11 @@ if show_news_pulse:
             st.success("News Shock thấp. Không thấy cụm tin xấu nổi bật trong RSS hiện tại.")
 
 if not run:
-    st.info("Bấm nút quét để bắt đầu. Bản V1.7 vẫn cập nhật Live Macro/Tin tức ở trên khi app đang mở.")
+    st.info("Bấm nút quét để bắt đầu. Bản V1.8 đã siết vùng mua đỏ theo biên dao động cổ phiếu Việt Nam.")
     st.stop()
 
 tickers = parse_tickers(ticker_text)
-cfg = {"min_val":min_val, "base_window":base_window, "volume_spike":volume_spike, "max_base_range_pct":max_base}
+cfg = {"min_val":min_val, "base_window":base_window, "volume_spike":volume_spike, "max_base_range_pct":max_base, "vn_base_cap_pct":vn_base_cap_pct, "vn_red_zone_pct":vn_red_zone_pct, "vn_stop_pct":vn_stop_pct, "vn_no_chase_pct":vn_no_chase_pct}
 errors = []
 
 if data_mode == "Demo":
@@ -699,7 +789,7 @@ else:
         quick_res["quick_rank_score"] = quick_res["victory_score"]*.45 + quick_res["money_flow_score"]*2.0 + quick_res["concentration_score"]*.25
         shortlist = quick_res.sort_values("quick_rank_score", ascending=False).head(deep_top).ticker.tolist()
         st.success(f"Vòng 1 tải được {quick_prices.ticker.nunique()} mã. Chọn {len(shortlist)} mã tốt nhất để phân tích sâu.")
-        st.dataframe(quick_res.sort_values("quick_rank_score", ascending=False).head(20)[["ticker","sector","quick_rank_score","money_flow_score","victory_score","phase","red_buy_zone"]], use_container_width=True, hide_index=True)
+        st.dataframe(quick_res.sort_values("quick_rank_score", ascending=False).head(20)[["ticker","sector","quick_rank_score","money_flow_score","victory_score","phase","base_range_pct","red_buy_zone"]], use_container_width=True, hide_index=True)
 
         st.subheader("Vòng 2: Phân tích sâu top ứng viên")
         prices, e2 = fetch_universe_parallel(shortlist, deep_days, end_date, len(shortlist), workers)
@@ -794,7 +884,7 @@ st.dataframe(focus, use_container_width=True, hide_index=True, column_config={
 })
 
 st.subheader("5) Bảng hành động thực chiến")
-cols = ["ticker","sector","victory_score","victory_label","concentration_label","concentration_score","money_flow_score","money_flow_state","phase","signal","action_decision","close","base_zone","red_buy_zone","buy_zone_A","buy_zone_B","buy_zone_C","stop_loss","target_near","risk_pct_from_close","reward_pct_to_base_high","rr_to_base_high","rs20_vs_market_pct","why_focus"]
+cols = ["ticker","sector","victory_score","victory_label","concentration_label","concentration_score","money_flow_score","money_flow_state","phase","signal","action_decision","close","base_zone","base_range_pct","atr14_pct","red_buy_zone","buy_zone_A","buy_zone_B","buy_zone_C","stop_loss","target_near","risk_pct_from_close","reward_pct_to_base_high","rr_to_base_high","rs20_vs_market_pct","base_method","why_focus"]
 st.dataframe(res.sort_values(["victory_score","concentration_score"], ascending=False)[cols], use_container_width=True, hide_index=True, column_config={
     "victory_score": st.column_config.ProgressColumn("Điểm thắng TT", min_value=0, max_value=100, format="%.1f"),
     "concentration_score": st.column_config.ProgressColumn("Điểm cô đặc", min_value=0, max_value=100, format="%.1f"),
