@@ -13,6 +13,7 @@ import math
 from datetime import date, timedelta
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -1049,8 +1050,8 @@ def make_candlestick_chart(tg: pd.DataFrame, detail: Dict) -> go.Figure:
 # -----------------------------
 def main():
     st.set_page_config(page_title="Smart Money Red Base Scanner", layout="wide")
-    st.title("Smart Money Red Base Scanner – Auto Data MVP V0.7")
-    st.caption("Tự tải dữ liệu thị trường, quét dấu hiệu tay to gom hàng, ưu tiên mua đỏ trong nền, không mua xanh/đu break. Nếu VNINDEX không tải được, app tự tạo chỉ số thị trường thay thế từ rổ mã đã tải.")
+    st.title("Smart Money Red Base Scanner – Auto Data MVP V0.8 Fast")
+    st.caption("Tự tải dữ liệu thị trường, quét dấu hiệu tay to gom hàng, ưu tiên mua đỏ trong nền. Bản V0.8 tối ưu tốc độ: tải song song, mặc định ít mã hơn, có cache dữ liệu.")
 
     with st.expander("Triết lý hệ thống", expanded=False):
         st.markdown(
@@ -1062,6 +1063,7 @@ def main():
         )
 
     st.sidebar.header("1) Dữ liệu tự động")
+    st.sidebar.info("Chạy nhanh trước: 20–30 mã, 180–240 ngày. Sau khi ổn mới tăng số mã/ngày.")
     data_mode = st.sidebar.radio(
         "Chọn nguồn dữ liệu",
         ["Tự động: Vnstock → Yahoo fallback", "Tự động: Vnstock", "Tự động: Yahoo", "Upload thủ công", "Demo"],
@@ -1076,7 +1078,7 @@ def main():
     provider = provider_map.get(data_mode, "Auto")
     vnstock_source = st.sidebar.selectbox("Nguồn Vnstock", ["VCI", "KBS"], index=0, disabled=not data_mode.startswith("Tự động"))
 
-    lookback_days = st.sidebar.slider("Số ngày lịch sử cần tải", 180, 900, 420, 30, disabled=not data_mode.startswith("Tự động"))
+    lookback_days = st.sidebar.slider("Số ngày lịch sử cần tải", 120, 900, 240, 30, disabled=not data_mode.startswith("Tự động"), help="Chạy nhanh: 180-240 ngày. Quét sâu: 420 ngày trở lên.")
     end_dt = st.sidebar.date_input("Ngày kết thúc", value=date.today(), disabled=not data_mode.startswith("Tự động"))
     start_dt = end_dt - timedelta(days=int(lookback_days))
 
@@ -1102,7 +1104,8 @@ def main():
         disabled=not data_mode.startswith("Tự động"),
         help="Có thể sửa trực tiếp: HPG, SSI, FPT... App sẽ tự tải giá từng mã và VNINDEX.",
     )
-    max_symbols = st.sidebar.slider("Giới hạn số mã tải", 10, 300, min(80, len(parse_ticker_text(ticker_text)) or 80), 10, disabled=not data_mode.startswith("Tự động"))
+    max_symbols = st.sidebar.slider("Giới hạn số mã tải", 5, 300, min(25, len(parse_ticker_text(ticker_text)) or 25), 5, disabled=not data_mode.startswith("Tự động"), help="Chạy nhanh: 15-30 mã. Quét toàn bộ: tăng lên sau khi test ổn.")
+    worker_count = st.sidebar.slider("Số luồng tải song song", 1, 8, 4, 1, disabled=not data_mode.startswith("Tự động"), help="Tăng số luồng giúp tải nhanh hơn nhưng có thể bị nguồn dữ liệu giới hạn nếu quá cao.")
 
     price_file = st.sidebar.file_uploader("Upload prices.csv/xlsx", type=["csv", "xlsx", "xls"], disabled=data_mode != "Upload thủ công")
     index_file = st.sidebar.file_uploader("Upload vnindex.csv/xlsx", type=["csv", "xlsx", "xls"], disabled=data_mode != "Upload thủ công")
@@ -1149,14 +1152,23 @@ def main():
                 # 2) Load equities. The scanner can still run if we later build a synthetic market proxy.
                 parts = []
                 failed = []
-                progress = st.progress(0, text="Đang tải mã...")
-                for i, t in enumerate(tickers, start=1):
-                    df_one, err = fetch_one_symbol(t, start_str, end_str, provider, vnstock_source)
-                    if not df_one.empty:
-                        parts.append(df_one)
-                    if err:
-                        failed.append(err)
-                    progress.progress(i / len(tickers), text=f"Đã xử lý {i}/{len(tickers)} mã")
+                progress = st.progress(0, text="Đang tải mã song song...")
+                with ThreadPoolExecutor(max_workers=int(worker_count)) as executor:
+                    future_map = {
+                        executor.submit(fetch_one_symbol, t, start_str, end_str, provider, vnstock_source): t
+                        for t in tickers
+                    }
+                    for i, future in enumerate(as_completed(future_map), start=1):
+                        t = future_map[future]
+                        try:
+                            df_one, err = future.result()
+                        except Exception as e:
+                            df_one, err = pd.DataFrame(), f"{t}: {e}"
+                        if not df_one.empty:
+                            parts.append(df_one)
+                        if err:
+                            failed.append(err)
+                        progress.progress(i / len(tickers), text=f"Đã xử lý {i}/{len(tickers)} mã")
                 progress.empty()
 
                 if not parts:
@@ -1298,4 +1310,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
