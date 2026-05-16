@@ -1,5 +1,5 @@
 """
-Smart Money Red Base Scanner - MVP V1.2 Money Flow Concentration
+Smart Money Red Base Scanner - MVP V1.3 Focus 3 Money Flow Concentration
 Author: ChatGPT
 Purpose: Scan Vietnamese stock candidates using an early-accumulation, red-base buying style.
 
@@ -1302,8 +1302,8 @@ def make_candlestick_chart(tg: pd.DataFrame, detail: Dict) -> go.Figure:
 # -----------------------------
 def main():
     st.set_page_config(page_title="Smart Money Red Base Scanner", layout="wide")
-    st.title("Smart Money Red Base Scanner – Auto Data MVP V1.2 Money Flow")
-    st.caption("Tự tải dữ liệu thị trường, quét dấu hiệu tay to gom hàng, ưu tiên mua đỏ trong nền. Bản V1.2: thêm bộ lọc dòng tiền, xếp hạng cô đặc 2-3 mã tốt nhất, tránh dàn trải quá nhiều mã.")
+    st.title("Smart Money Red Base Scanner – Auto Data MVP V1.3 Focus 3 Money Flow")
+    st.caption("Tự tải dữ liệu thị trường, quét dấu hiệu tay to gom hàng, ưu tiên mua đỏ trong nền. Bản V1.3: thêm bản đồ dòng tiền theo ngành và bảng Focus 2-3 mã cuối cùng. Nếu bộ lọc quá gắt, app vẫn chọn ra các ứng viên tốt nhất để theo dõi nhưng gắn nhãn rõ cấp độ.")
 
     with st.expander("Triết lý hệ thống", expanded=False):
         st.markdown(
@@ -1499,23 +1499,92 @@ def main():
     c4.metric("Cảnh báo phân phối", f"{(scan_df['signal'] == 'Distribution Warning').sum()}")
     c5.metric("Điểm cô đặc cao nhất", f"{scan_df['concentration_score'].max():.1f}")
 
-    st.subheader("Top 2-3 mã cô đặc theo dòng tiền")
-    st.caption("Bảng này lọc tiếp từ nhóm cổ phiếu tốt: ưu tiên dòng tiền, gom hàng, vị trí giá trong nền và rủi ro. Mục tiêu là tránh dàn trải, chỉ chọn vài mã tốt nhất để theo dõi sát.")
-    concentrated_df = scan_df[
+    st.subheader("Bản đồ dòng tiền theo ngành")
+    st.caption("Trước khi chọn mã cô đặc, xem ngành nào đang có tiền. Cổ tốt mà ngành không có tiền thì xác suất chạy thường thấp hơn.")
+    sector_flow_df = (
+        scan_df.groupby("sector", dropna=False)
+        .agg(
+            so_ma=("ticker", "count"),
+            diem_dong_tien_tb=("money_flow_score", "mean"),
+            diem_co_dac_tb=("concentration_score", "mean"),
+            diem_co_dac_max=("concentration_score", "max"),
+            ung_vien_mua_do=("action_decision", lambda x: x.isin(["CÓ THỂ CANH MUA ĐỎ", "CHỈ THĂM DÒ NHỎ", "CHỜ VỀ VÙNG MUA"]).sum()),
+        )
+        .reset_index()
+    )
+    sector_flow_df["sector_flow_rank"] = (
+        sector_flow_df["diem_dong_tien_tb"] * 0.45
+        + sector_flow_df["diem_co_dac_tb"] * 0.35
+        + sector_flow_df["ung_vien_mua_do"] * 3
+        + sector_flow_df["diem_co_dac_max"] * 0.20
+    )
+    sector_flow_df = sector_flow_df.sort_values("sector_flow_rank", ascending=False).head(8)
+    st.dataframe(
+        sector_flow_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "diem_dong_tien_tb": st.column_config.ProgressColumn("Dòng tiền TB", min_value=0, max_value=25),
+            "diem_co_dac_tb": st.column_config.ProgressColumn("Cô đặc TB", min_value=0, max_value=100),
+            "diem_co_dac_max": st.column_config.ProgressColumn("Cô đặc cao nhất", min_value=0, max_value=100),
+            "sector_flow_rank": st.column_config.NumberColumn("Xếp hạng ngành", format="%.1f"),
+        },
+    )
+
+    st.subheader("Focus 2-3 mã cuối cùng")
+    st.caption("Bảng này là lớp lọc cuối: ưu tiên dòng tiền, gom hàng, vị trí giá trong nền và rủi ro. Nếu bộ lọc nghiêm ngặt chỉ ra ít mã, app vẫn chọn thêm ứng viên tốt nhất để anh theo dõi, nhưng gắn nhãn cấp độ rõ ràng.")
+
+    avoid_actions = ["TRÁNH MUA", "LOẠI/THEO DÕI LẠI SAU"]
+    strict_mask = (
         (scan_df["money_flow_score"] >= min_money_flow_for_top) &
         (scan_df["concentration_score"] >= min_concentration_score) &
-        (~scan_df["action_decision"].isin(["TRÁNH MUA", "LOẠI/THEO DÕI LẠI SAU", "CHƯA ƯU TIÊN - DÒNG TIỀN YẾU"]))
-    ].copy()
-    concentrated_df = concentrated_df.sort_values(["concentration_score", "money_flow_score", "score"], ascending=[False, False, False]).head(top_n_concentrated)
-    if concentrated_df.empty:
-        st.warning("Chưa có mã nào đạt bộ lọc cô đặc. Có thể giảm ngưỡng dòng tiền/cô đặc, hoặc quét thêm mã, nhưng không nên hạ tiêu chuẩn quá mức.")
+        (~scan_df["action_decision"].isin(avoid_actions + ["CHƯA ƯU TIÊN - DÒNG TIỀN YẾU"]))
+    )
+    core_df = scan_df[strict_mask].copy()
+    core_df["selection_tier"] = "CORE - đủ dòng tiền & setup"
+
+    # Fallback thông minh: nếu chưa đủ 2-3 mã, vẫn lấy ứng viên tốt nhất trong nhóm không bị phân phối/thủng nền.
+    # Điều này giúp app đúng mục tiêu cô đặc: luôn trả về vài mã đáng theo dõi nhất, nhưng không làm giả tín hiệu mua.
+    fallback_mask = (
+        (~scan_df["action_decision"].isin(avoid_actions)) &
+        (~scan_df["phase"].isin(["Cảnh báo phân phối", "Thủng nền/suy yếu"]))
+    )
+    fallback_df = scan_df[fallback_mask].copy()
+    fallback_df = fallback_df[~fallback_df["ticker"].isin(core_df["ticker"].tolist())]
+    fallback_df["selection_tier"] = np.where(
+        fallback_df["money_flow_score"] >= 8,
+        "WATCH - ứng viên tốt nhất, chờ điểm mua/dòng tiền mạnh hơn",
+        "EARLY - theo dõi sớm, dòng tiền chưa đủ mạnh"
+    )
+
+    focus_df = pd.concat([core_df, fallback_df], ignore_index=True)
+    if not focus_df.empty:
+        tier_rank = {
+            "CORE - đủ dòng tiền & setup": 1,
+            "WATCH - ứng viên tốt nhất, chờ điểm mua/dòng tiền mạnh hơn": 2,
+            "EARLY - theo dõi sớm, dòng tiền chưa đủ mạnh": 3,
+        }
+        focus_df["tier_rank"] = focus_df["selection_tier"].map(tier_rank).fillna(9)
+        focus_df["why_focus"] = (
+            focus_df["money_flow_state"].astype(str) + " | " +
+            focus_df["phase"].astype(str) + " | " +
+            focus_df["current_position"].astype(str)
+        )
+        focus_df = focus_df.sort_values(
+            ["tier_rank", "concentration_score", "money_flow_score", "score", "rr_to_base_high"],
+            ascending=[True, False, False, False, False]
+        ).head(top_n_concentrated).drop(columns=["tier_rank"])
+        focus_df.insert(0, "rank", range(1, len(focus_df) + 1))
+
+    if focus_df.empty:
+        st.warning("Chưa có mã nào đủ điều kiện theo dõi cô đặc. Giảm số mã quá thấp hoặc dữ liệu chưa đủ có thể làm app không tìm được ứng viên.")
     else:
         top_cols = [
-            "ticker", "sector", "concentration_score", "concentration_label", "money_flow_score", "money_flow_state",
-            "score", "action_decision", "phase", "close", "red_buy_zone", "stop_loss", "rr_to_base_high", "buy_trigger"
+            "rank", "ticker", "sector", "selection_tier", "concentration_score", "money_flow_score", "money_flow_state",
+            "score", "action_decision", "phase", "close", "red_buy_zone", "stop_loss", "rr_to_base_high", "why_focus", "buy_trigger"
         ]
         st.dataframe(
-            concentrated_df[top_cols],
+            focus_df[top_cols],
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -1525,6 +1594,7 @@ def main():
                 "rr_to_base_high": st.column_config.NumberColumn("R/R", format="%.2f"),
             },
         )
+        st.info("Cách dùng: chỉ ưu tiên giải ngân nếu mã nằm CORE/WATCH, giá về vùng mua đỏ và không thủng stop-loss. EARLY chỉ để theo dõi, chưa nên cô đặc vốn.")
 
     st.subheader("Bảng hành động thực chiến")
     st.caption("Ưu tiên đọc bảng này trước: app không khuyến nghị mua đuổi, chỉ đưa kế hoạch có điều kiện theo phong cách mua đỏ trong nền.")
