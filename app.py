@@ -13,7 +13,7 @@ import math
 from datetime import date, timedelta
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
 import numpy as np
 import pandas as pd
@@ -290,7 +290,7 @@ def fetch_history_yfinance(symbol: str, start: str, end: str, is_index: bool = F
     last_error = None
     for ysym in candidates:
         try:
-            df = yf.download(ysym, start=start, end=end, interval="1d", progress=False, auto_adjust=False)
+            df = yf.download(ysym, start=start, end=end, interval="1d", progress=False, auto_adjust=False, timeout=12)
             if df is None or df.empty:
                 continue
             if isinstance(df.columns, pd.MultiIndex):
@@ -1050,8 +1050,8 @@ def make_candlestick_chart(tg: pd.DataFrame, detail: Dict) -> go.Figure:
 # -----------------------------
 def main():
     st.set_page_config(page_title="Smart Money Red Base Scanner", layout="wide")
-    st.title("Smart Money Red Base Scanner – Auto Data MVP V0.8 Fast")
-    st.caption("Tự tải dữ liệu thị trường, quét dấu hiệu tay to gom hàng, ưu tiên mua đỏ trong nền. Bản V0.8 tối ưu tốc độ: tải song song, mặc định ít mã hơn, có cache dữ liệu.")
+    st.title("Smart Money Red Base Scanner – Auto Data MVP V0.9 Fast Safe")
+    st.caption("Tự tải dữ liệu thị trường, quét dấu hiệu tay to gom hàng, ưu tiên mua đỏ trong nền. Bản V0.9 chống treo: mặc định Yahoo nhanh, có nút chạy quét, giới hạn ít mã, bỏ qua nguồn dữ liệu chậm.")
 
     with st.expander("Triết lý hệ thống", expanded=False):
         st.markdown(
@@ -1063,10 +1063,10 @@ def main():
         )
 
     st.sidebar.header("1) Dữ liệu tự động")
-    st.sidebar.info("Chạy nhanh trước: 20–30 mã, 180–240 ngày. Sau khi ổn mới tăng số mã/ngày.")
+    st.sidebar.info("Bản chống treo: chạy 5–10 mã và 120–180 ngày trước. Nguồn mặc định là Yahoo để tránh Vnstock bị treo trên cloud.")
     data_mode = st.sidebar.radio(
         "Chọn nguồn dữ liệu",
-        ["Tự động: Vnstock → Yahoo fallback", "Tự động: Vnstock", "Tự động: Yahoo", "Upload thủ công", "Demo"],
+        ["Tự động: Yahoo", "Tự động: Vnstock → Yahoo fallback", "Tự động: Vnstock", "Upload thủ công", "Demo"],
         index=0,
     )
 
@@ -1078,7 +1078,7 @@ def main():
     provider = provider_map.get(data_mode, "Auto")
     vnstock_source = st.sidebar.selectbox("Nguồn Vnstock", ["VCI", "KBS"], index=0, disabled=not data_mode.startswith("Tự động"))
 
-    lookback_days = st.sidebar.slider("Số ngày lịch sử cần tải", 120, 900, 240, 30, disabled=not data_mode.startswith("Tự động"), help="Chạy nhanh: 180-240 ngày. Quét sâu: 420 ngày trở lên.")
+    lookback_days = st.sidebar.slider("Số ngày lịch sử cần tải", 90, 420, 180, 30, disabled=not data_mode.startswith("Tự động"), help="Chạy nhanh: 120-180 ngày. Chỉ tăng khi app đã ổn.")
     end_dt = st.sidebar.date_input("Ngày kết thúc", value=date.today(), disabled=not data_mode.startswith("Tự động"))
     start_dt = end_dt - timedelta(days=int(lookback_days))
 
@@ -1104,12 +1104,17 @@ def main():
         disabled=not data_mode.startswith("Tự động"),
         help="Có thể sửa trực tiếp: HPG, SSI, FPT... App sẽ tự tải giá từng mã và VNINDEX.",
     )
-    max_symbols = st.sidebar.slider("Giới hạn số mã tải", 5, 300, min(25, len(parse_ticker_text(ticker_text)) or 25), 5, disabled=not data_mode.startswith("Tự động"), help="Chạy nhanh: 15-30 mã. Quét toàn bộ: tăng lên sau khi test ổn.")
-    worker_count = st.sidebar.slider("Số luồng tải song song", 1, 8, 4, 1, disabled=not data_mode.startswith("Tự động"), help="Tăng số luồng giúp tải nhanh hơn nhưng có thể bị nguồn dữ liệu giới hạn nếu quá cao.")
+    max_symbols = st.sidebar.slider("Giới hạn số mã tải", 3, 60, min(10, len(parse_ticker_text(ticker_text)) or 10), 1, disabled=not data_mode.startswith("Tự động"), help="Chạy nhanh: 5-10 mã. Sau khi ổn mới tăng 20-30 mã.")
+    worker_count = st.sidebar.slider("Số luồng tải song song", 1, 5, 2, 1, disabled=not data_mode.startswith("Tự động"), help="Để 2 luồng cho ổn định trên Streamlit Cloud. Tăng cao dễ bị nguồn dữ liệu giới hạn.")
 
     price_file = st.sidebar.file_uploader("Upload prices.csv/xlsx", type=["csv", "xlsx", "xls"], disabled=data_mode != "Upload thủ công")
     index_file = st.sidebar.file_uploader("Upload vnindex.csv/xlsx", type=["csv", "xlsx", "xls"], disabled=data_mode != "Upload thủ công")
     fundamental_file = st.sidebar.file_uploader("Upload fundamentals.csv/xlsx tùy chọn", type=["csv", "xlsx", "xls"], disabled=data_mode not in ["Upload thủ công"])
+
+    run_scan_now = True
+    if data_mode.startswith("Tự động"):
+        run_scan_now = st.sidebar.button("🚀 Chạy quét nhanh", type="primary", use_container_width=True)
+        st.sidebar.caption("Nếu app đứng lâu: bấm Stop ở góc phải, giảm còn 5 mã/120 ngày, rồi bấm Chạy quét nhanh lại.")
 
     st.sidebar.header("2) Cấu hình quét")
     min_value_bil = st.sidebar.number_input("GTGD bình quân 20 phiên tối thiểu (tỷ VND)", min_value=0.0, value=5.0, step=1.0)
@@ -1123,6 +1128,10 @@ def main():
         volume_anomaly_mult=volume_mult,
         max_base_width_pct=max_base_width_pct,
     )
+
+    if data_mode.startswith("Tự động") and not run_scan_now:
+        st.info("App đã sẵn sàng. Bấm **🚀 Chạy quét nhanh** ở thanh bên trái để bắt đầu tải dữ liệu. Mặc định chỉ chạy 10 mã/180 ngày để tránh treo trên Streamlit Cloud.")
+        st.stop()
 
     try:
         if data_mode == "Demo":
@@ -1158,17 +1167,31 @@ def main():
                         executor.submit(fetch_one_symbol, t, start_str, end_str, provider, vnstock_source): t
                         for t in tickers
                     }
-                    for i, future in enumerate(as_completed(future_map), start=1):
-                        t = future_map[future]
-                        try:
-                            df_one, err = future.result()
-                        except Exception as e:
-                            df_one, err = pd.DataFrame(), f"{t}: {e}"
-                        if not df_one.empty:
-                            parts.append(df_one)
-                        if err:
-                            failed.append(err)
-                        progress.progress(i / len(tickers), text=f"Đã xử lý {i}/{len(tickers)} mã")
+                    pending = set(future_map.keys())
+                    done_count = 0
+                    total_timeout = max(35, len(tickers) * 8)
+                    waited = 0
+                    while pending and waited < total_timeout:
+                        done, pending = wait(pending, timeout=5, return_when=FIRST_COMPLETED)
+                        waited += 5
+                        for future in done:
+                            t = future_map[future]
+                            done_count += 1
+                            try:
+                                df_one, err = future.result(timeout=1)
+                            except Exception as e:
+                                df_one, err = pd.DataFrame(), f"{t}: {e}"
+                            if not df_one.empty:
+                                parts.append(df_one)
+                            if err:
+                                failed.append(err)
+                            progress.progress(done_count / len(tickers), text=f"Đã xử lý {done_count}/{len(tickers)} mã")
+                    for fut in pending:
+                        t = future_map[fut]
+                        fut.cancel()
+                        failed.append(f"{t}: nguồn dữ liệu quá chậm, đã bỏ qua để app không treo")
+                    if pending:
+                        st.warning(f"Có {len(pending)} mã tải quá chậm nên app đã bỏ qua thay vì treo.")
                 progress.empty()
 
                 if not parts:
