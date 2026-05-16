@@ -1,1736 +1,829 @@
-"""
-Smart Money Red Base Scanner - MVP V1.3 Focus 3 Money Flow Concentration
-Author: ChatGPT
-Purpose: Scan Vietnamese stock candidates using an early-accumulation, red-base buying style.
-
-This app is an analytical tool, not financial advice. Always verify data and manage risk.
-"""
-
 from __future__ import annotations
 
-import io
-import math
-import json
-import time
+import re
 import urllib.parse
-import urllib.request
-from datetime import date, timedelta
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta, timezone
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
+st.set_page_config(page_title="Market Winner Scanner V1.7 Live Pulse", layout="wide", initial_sidebar_state="expanded")
 
-# -----------------------------
-# Configuration / Labels
-# -----------------------------
-REQUIRED_PRICE_COLUMNS = {"date", "ticker", "open", "high", "low", "close", "volume"}
-OPTIONAL_PRICE_COLUMNS = {"value", "sector"}
-REQUIRED_INDEX_COLUMNS = {"date", "open", "high", "low", "close"}
-FUNDAMENTAL_COLUMNS = {
-    "ticker",
-    "revenue_growth_yoy",
-    "profit_growth_yoy",
-    "roe",
-    "debt_to_equity",
-    "operating_cashflow_positive",
-    "expectation_score",
+# ============================================================
+# UNIVERSE
+# ============================================================
+CORE_69 = """
+HPG, SSI, FPT, MBB, TCB, VCB, BID, CTG, VPB, ACB, VIB, STB, SHB, HDB, TPB, LPB, MSB,
+VND, VCI, HCM, VIX, MBS, SHS, DGC, DPM, DCM, GAS, PVD, PVS, PLX, MWG, FRT, PNJ, DGW,
+MSN, VNM, VRE, VHM, VIC, KDH, NLG, DXG, DIG, CEO, HSG, NKG, GEX, GMD, VSC, SIP, IDC,
+KBC, SZC, PVT, HAH, ANV, VHC, PDR, HAG, BSR, POW, REE, PC1, CTR, CMG, EIB, OCB, SAB, BMP
+"""
+
+BROAD_180 = """
+HPG,HSG,NKG,SMC,TLH,VGS,TVN,SSI,VND,VCI,HCM,VIX,MBS,SHS,FTS,CTS,BSI,ORS,AGR,
+FPT,CMG,CTR,ELC,FOX,ITD,MBB,TCB,VCB,BID,CTG,VPB,ACB,VIB,STB,SHB,HDB,TPB,LPB,MSB,EIB,OCB,SSB,NAB,BVB,KLB,
+DGC,DPM,DCM,CSV,LAS,PLC,GAS,PVD,PVS,PLX,BSR,OIL,PVT,POW,REE,PC1,GEG,GEX,NT2,QTP,PPC,VSH,TTA,
+MWG,FRT,PNJ,DGW,PET,PSD,MSN,VNM,SAB,BMP,DBC,BAF,HAG,PAN,TAR,LTG,VHC,ANV,IDI,FMC,ACL,ASM,
+VHM,VIC,VRE,KDH,NLG,DXG,DIG,CEO,PDR,NVL,HDC,HDG,CRE,SCR,TCH,AGG,NTL,IJC,DRH,
+KBC,IDC,SZC,SIP,PHR,BCM,VGC,LHG,D2D,GVR,DTD,ITA,ITC,
+GMD,VSC,HAH,SCS,SGP,VOS,VTO,VIP,SKG,AST,ACV,HVN,VJC,SAS,
+FLC,ROS,DLG,ITA,HQC,LDG,CII,FCN,HHV,LCG,VCG,CTD,HBC,PC1,DPG,C4G,HT1,BCC,CTI,
+IMP,DHG,TRA,DVN,DBD,TNH,JVC,DCL,AMV,AAA,APH,NTP,DNP,PTB,TTF,GIL,MSH,TCM,TNG,VGT
+"""
+
+SECTOR_MAP = {
+    **{x:"Thép" for x in "HPG HSG NKG SMC TLH VGS TVN".split()},
+    **{x:"Chứng khoán" for x in "SSI VND VCI HCM VIX MBS SHS FTS CTS BSI ORS AGR".split()},
+    **{x:"Công nghệ" for x in "FPT CMG CTR ELC FOX ITD".split()},
+    **{x:"Ngân hàng" for x in "MBB TCB VCB BID CTG VPB ACB VIB STB SHB HDB TPB LPB MSB EIB OCB SSB NAB BVB KLB".split()},
+    **{x:"Hóa chất/Phân bón" for x in "DGC DPM DCM CSV LAS PLC".split()},
+    **{x:"Dầu khí" for x in "GAS PVD PVS PLX BSR OIL PVT".split()},
+    **{x:"Điện/Năng lượng" for x in "POW REE PC1 GEG NT2 QTP PPC VSH TTA".split()},
+    **{x:"Bán lẻ" for x in "MWG FRT PNJ DGW PET PSD".split()},
+    **{x:"Tiêu dùng/Nông nghiệp" for x in "MSN VNM SAB BMP DBC BAF HAG PAN TAR LTG".split()},
+    **{x:"Thủy sản" for x in "VHC ANV IDI FMC ACL ASM".split()},
+    **{x:"Bất động sản" for x in "VHM VIC VRE KDH NLG DXG DIG CEO PDR NVL HDC HDG CRE SCR TCH AGG NTL IJC DRH".split()},
+    **{x:"KCN" for x in "KBC IDC SZC SIP PHR BCM VGC LHG D2D GVR DTD ITA ITC".split()},
+    **{x:"Cảng/Logistics/Hàng không" for x in "GMD VSC HAH SCS SGP VOS VTO VIP SKG AST ACV HVN VJC SAS".split()},
+    **{x:"Đầu tư công/Xây dựng" for x in "CII FCN HHV LCG VCG CTD HBC DPG C4G HT1 BCC CTI".split()},
+    **{x:"Y tế/Dược" for x in "IMP DHG TRA DVN DBD TNH JVC DCL AMV".split()},
+    **{x:"Nhựa/Gỗ/Dệt may" for x in "AAA APH NTP DNP PTB TTF GIL MSH TCM TNG VGT".split()},
 }
 
-
-# Universe mặc định: nhóm thanh khoản/vốn hóa thường được thị trường theo dõi.
-# Người dùng vẫn có thể sửa danh sách trong sidebar, nhưng app không còn bắt buộc upload file giá.
-DEFAULT_TICKERS = [
-    "HPG", "SSI", "FPT", "MBB", "TCB", "VCB", "BID", "CTG", "VPB", "ACB",
-    "VIB", "STB", "SHB", "HDB", "TPB", "LPB", "MSB", "VND", "VCI", "HCM",
-    "VIX", "MBS", "SHS", "DGC", "DPM", "DCM", "GAS", "PVD", "PVS", "PLX",
-    "VNM", "MSN", "MWG", "FRT", "DGW", "PNJ", "SAB", "VRE", "VHM", "VIC",
-    "KDH", "NLG", "DXG", "DIG", "CEO", "KBC", "SZC", "BCM", "GVR", "VGC",
-    "HSG", "NKG", "HAG", "HNG", "ANV", "VHC", "GEX", "REE", "PC1", "POW",
-    "CTR", "CMG", "FOX", "FPT", "DPR", "PHR", "PVT", "GMD", "HAH", "VSC"
-]
-
-VN30_LIKE_TICKERS = [
-    "ACB", "BID", "BVH", "CTG", "FPT", "GAS", "GVR", "HDB", "HPG", "MBB",
-    "MSN", "MWG", "PLX", "POW", "SAB", "SHB", "SSB", "SSI", "STB", "TCB",
-    "TPB", "VCB", "VHM", "VIB", "VIC", "VJC", "VNM", "VPB", "VRE", "VPI"
-]
-
-DEFAULT_SECTOR_MAP = {
-    # Ngân hàng
-    "VCB": "Ngân hàng", "BID": "Ngân hàng", "CTG": "Ngân hàng", "MBB": "Ngân hàng", "TCB": "Ngân hàng",
-    "VPB": "Ngân hàng", "ACB": "Ngân hàng", "STB": "Ngân hàng", "HDB": "Ngân hàng", "VIB": "Ngân hàng",
-    "SHB": "Ngân hàng", "TPB": "Ngân hàng", "LPB": "Ngân hàng", "MSB": "Ngân hàng", "SSB": "Ngân hàng",
-    # Chứng khoán
-    "SSI": "Chứng khoán", "VND": "Chứng khoán", "VCI": "Chứng khoán", "HCM": "Chứng khoán", "VIX": "Chứng khoán",
-    "MBS": "Chứng khoán", "SHS": "Chứng khoán", "FTS": "Chứng khoán", "CTS": "Chứng khoán", "BSI": "Chứng khoán",
-    # Thép/vật liệu
-    "HPG": "Thép", "HSG": "Thép", "NKG": "Thép", "SMC": "Thép", "TLH": "Thép",
-    "GVR": "Cao su", "DPR": "Cao su", "PHR": "Cao su", "BMP": "Nhựa", "NTP": "Nhựa",
-    # Bất động sản/KCN
-    "VHM": "Bất động sản", "VIC": "Bất động sản", "VRE": "Bất động sản", "KDH": "Bất động sản", "NLG": "Bất động sản",
-    "DXG": "Bất động sản", "DIG": "Bất động sản", "CEO": "Bất động sản", "NVL": "Bất động sản", "PDR": "Bất động sản",
-    "KBC": "Khu công nghiệp", "SZC": "Khu công nghiệp", "BCM": "Khu công nghiệp", "VGC": "Khu công nghiệp", "IDC": "Khu công nghiệp",
-    # Dầu khí/điện/hóa chất
-    "GAS": "Dầu khí", "PVD": "Dầu khí", "PVS": "Dầu khí", "PLX": "Dầu khí", "BSR": "Dầu khí", "PVT": "Dầu khí",
-    "POW": "Điện", "REE": "Điện", "PC1": "Điện", "NT2": "Điện", "GEG": "Điện",
-    "DGC": "Hóa chất", "DPM": "Hóa chất", "DCM": "Hóa chất", "CSV": "Hóa chất", "LAS": "Hóa chất",
-    # Tiêu dùng/bán lẻ/công nghệ
-    "FPT": "Công nghệ", "CMG": "Công nghệ", "FOX": "Công nghệ", "CTR": "Công nghệ",
-    "MWG": "Bán lẻ", "FRT": "Bán lẻ", "DGW": "Bán lẻ", "PNJ": "Bán lẻ", "PET": "Bán lẻ",
-    "VNM": "Tiêu dùng", "MSN": "Tiêu dùng", "SAB": "Tiêu dùng", "KDC": "Tiêu dùng", "QNS": "Tiêu dùng",
-    # Xuất khẩu/logistics/nông nghiệp
-    "GMD": "Logistics", "HAH": "Logistics", "VSC": "Logistics", "VTP": "Logistics",
-    "VHC": "Thủy sản", "ANV": "Thủy sản", "IDI": "Thủy sản", "HAG": "Nông nghiệp", "HNG": "Nông nghiệp",
+MACRO = {
+    "S&P500":"^GSPC", "Nasdaq":"^IXIC", "DowJones":"^DJI", "VIX":"^VIX",
+    "Nikkei":"^N225", "HangSeng":"^HSI", "Shanghai":"000001.SS", "KOSPI":"^KS11", "Taiwan":"^TWII", "Singapore":"^STI",
+    "WTI":"CL=F", "Brent":"BZ=F", "DXY":"DX-Y.NYB", "US10Y":"^TNX", "Gold":"GC=F",
 }
 
-
-@dataclass
-class ScanConfig:
-    min_avg_value_20: float = 5_000_000_000  # VND
-    min_sessions: int = 80
-    base_window: int = 60
-    short_window: int = 20
-    atr_window: int = 14
-    volume_anomaly_mult: float = 1.5
-    strong_volume_mult: float = 1.8
-    buy_zone_fraction: float = 0.35
-    no_chase_fraction: float = 0.65
-    stop_atr_buffer: float = 0.5
-    max_base_width_pct: float = 0.28
-    red_day_threshold: float = 0.0
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+def clamp(x, a, b):
+    try:
+        if np.isnan(x):
+            return a
+    except Exception:
+        pass
+    return float(max(a, min(b, x)))
 
 
-# -----------------------------
-# Utility functions
-# -----------------------------
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-    return df
+def norm_ticker(x: str) -> str:
+    return str(x).strip().upper().replace(".VN", "").replace(".HN", "")
 
 
-def read_csv_excel(file) -> pd.DataFrame:
-    if file is None:
-        raise ValueError("No file provided")
-    name = file.name.lower()
-    if name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(file)
-    return pd.read_csv(file)
-
-
-def ensure_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    df = df.copy()
-    for c in cols:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
-
-def preprocess_prices(df: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_columns(df)
-    missing = REQUIRED_PRICE_COLUMNS - set(df.columns)
-    if missing:
-        raise ValueError(f"File giá thiếu cột bắt buộc: {', '.join(sorted(missing))}")
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
-    if "sector" not in df.columns:
-        df["sector"] = "Unknown"
-    if "value" not in df.columns:
-        df["value"] = df["close"] * df["volume"]
-    numeric_cols = ["open", "high", "low", "close", "volume", "value"]
-    df = ensure_numeric(df, numeric_cols)
-    df = df.dropna(subset=["date", "ticker", "open", "high", "low", "close", "volume"])
-    df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
-    return df
-
-
-def preprocess_index(df: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_columns(df)
-    missing = REQUIRED_INDEX_COLUMNS - set(df.columns)
-    if missing:
-        raise ValueError(f"File VNIndex thiếu cột bắt buộc: {', '.join(sorted(missing))}")
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    numeric_cols = ["open", "high", "low", "close", "volume", "value"]
-    df = ensure_numeric(df, [c for c in numeric_cols if c in df.columns])
-    df = df.dropna(subset=["date", "open", "high", "low", "close"])
-    df = df.sort_values("date").reset_index(drop=True)
-    return df
-
-
-def preprocess_fundamentals(df: Optional[pd.DataFrame]) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=list(FUNDAMENTAL_COLUMNS))
-    df = normalize_columns(df)
-    if "ticker" not in df.columns:
-        raise ValueError("File nền tảng/kỳ vọng cần có cột ticker")
-    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
-    for col in FUNDAMENTAL_COLUMNS - {"ticker"}:
-        if col not in df.columns:
-            df[col] = np.nan
-    numeric_cols = list(FUNDAMENTAL_COLUMNS - {"ticker", "operating_cashflow_positive"})
-    df = ensure_numeric(df, numeric_cols)
-    if "operating_cashflow_positive" in df.columns:
-        df["operating_cashflow_positive"] = df["operating_cashflow_positive"].astype(str).str.lower().isin(["1", "true", "yes", "y", "có", "co", "positive"])
-    return df[list(FUNDAMENTAL_COLUMNS)]
-
-
-# -----------------------------
-# Online data loaders
-# -----------------------------
-def parse_ticker_text(text: str) -> List[str]:
-    """Parse comma/space/newline separated ticker text and deduplicate while preserving order."""
-    if not text:
-        return []
-    raw = []
-    for part in text.replace(";", ",").replace("\n", ",").replace(" ", ",").split(","):
-        t = part.strip().upper()
-        if t:
-            raw.append(t)
-    seen = set()
+def parse_tickers(text: str) -> List[str]:
     out = []
-    for t in raw:
-        if t not in seen:
-            seen.add(t)
+    for x in re.split(r"[,;\n\s]+", str(text)):
+        t = norm_ticker(x)
+        if t and t not in out:
             out.append(t)
     return out
 
 
-def normalize_external_history(df: pd.DataFrame, ticker: str, is_index: bool = False) -> pd.DataFrame:
-    """Normalize OHLCV from vnstock/yfinance into internal format.
-
-    Stocks are normalized to thousand-VND display units when the source returns VND/share.
-    `value` is kept in VND so liquidity filters remain meaningful.
-    """
-    if df is None or df.empty:
-        return pd.DataFrame()
-    x = normalize_columns(df)
-    rename_candidates = {
-        "time": "date", "trading_date": "date", "datetime": "date", "index": "date",
-        "adj_close": "close", "adjclose": "close",
-        "vol": "volume", "matched_volume": "volume", "total_volume": "volume",
-    }
-    x = x.rename(columns={k: v for k, v in rename_candidates.items() if k in x.columns})
-    if "date" not in x.columns and isinstance(x.index, pd.DatetimeIndex):
-        x = x.reset_index().rename(columns={"index": "date"})
-    required = {"date", "open", "high", "low", "close"}
-    if not required.issubset(set(x.columns)):
-        return pd.DataFrame()
-    if "volume" not in x.columns:
-        x["volume"] = 0
-    x = ensure_numeric(x, ["open", "high", "low", "close", "volume"])
-    x["date"] = pd.to_datetime(x["date"], errors="coerce").dt.tz_localize(None)
-    x = x.dropna(subset=["date", "open", "high", "low", "close"])
-    if x.empty:
-        return pd.DataFrame()
-
-    raw_close = x["close"].copy()
-    if not is_index:
-        # Many providers return VND/share (27050); some return thousand VND (27.05).
-        # Internally we display stock price as thousand VND, but calculate value in actual VND.
-        med = float(raw_close.dropna().median()) if raw_close.notna().any() else 0
-        if med > 1000:
-            for c in ["open", "high", "low", "close"]:
-                x[c] = x[c] / 1000.0
-            x["value"] = raw_close * x["volume"]
-        else:
-            x["value"] = x["close"] * 1000.0 * x["volume"]
-        x["ticker"] = ticker.upper()
-        x["sector"] = DEFAULT_SECTOR_MAP.get(ticker.upper(), "Unknown")
-        return preprocess_prices(x[["date", "ticker", "open", "high", "low", "close", "volume", "value", "sector"]])
-
-    out = x[["date", "open", "high", "low", "close", "volume"]].copy()
-    return preprocess_index(out)
+def unix(d: date) -> int:
+    return int(datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp())
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_history_vnstock(symbol: str, start: str, end: str, source: str = "VCI", is_index: bool = False) -> pd.DataFrame:
-    """Fetch OHLCV via Vnstock. Supports both recent Quote API and older helper API when available."""
-    symbol = symbol.upper().strip()
-    errors = []
-
-    # Modern documented API: from vnstock import Quote; Quote(symbol='HPG', source='VCI').history(...)
-    try:
-        from vnstock import Quote  # type: ignore
-        quote = Quote(symbol=symbol, source=source)
-        df = quote.history(start=start, end=end, interval="1D")
-        out = normalize_external_history(df, symbol, is_index=is_index)
-        if not out.empty:
-            return out
-    except Exception as e:
-        errors.append(f"Quote API lỗi: {e}")
-
-    # Compatibility with older vnstock/vnstock3 style.
-    try:
-        from vnstock import stock_historical_data  # type: ignore
-        df = stock_historical_data(symbol=symbol, start_date=start, end_date=end)
-        out = normalize_external_history(df, symbol, is_index=is_index)
-        if not out.empty:
-            return out
-    except Exception as e:
-        errors.append(f"Legacy API lỗi: {e}")
-
-    raise RuntimeError("; ".join(errors[-2:]) if errors else "Không lấy được dữ liệu")
-
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_history_yahoo_chart(symbol: str, start: str, end: str, is_index: bool = False) -> pd.DataFrame:
-    """Fetch OHLCV directly from Yahoo Chart API without yfinance.
-
-    This is often more stable on Streamlit Cloud than yfinance.download().
-    It tries Vietnamese stock suffixes used by Yahoo Finance, for example HPG.VN.
-    """
-    start_ts = int(pd.Timestamp(start).timestamp())
-    end_ts = int(pd.Timestamp(end).timestamp())
-    if end_ts <= start_ts:
-        end_ts = start_ts + 86400
-
-    if is_index:
-        candidates = ["^VNINDEX", "VNINDEX.VN", symbol]
-    else:
-        candidates = [f"{symbol}.VN", f"{symbol}.HN", symbol]
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
-        "Accept": "application/json,text/plain,*/*",
-    }
-    last_error = None
-    for ysym in candidates:
-        encoded = urllib.parse.quote(ysym, safe="")
-        url = (
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}"
-            f"?period1={start_ts}&period2={end_ts}&interval=1d&events=history&includeAdjustedClose=true"
-        )
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                raw = resp.read().decode("utf-8")
-            payload = json.loads(raw)
-            result = payload.get("chart", {}).get("result")
-            if not result:
-                err = payload.get("chart", {}).get("error")
-                last_error = err or "empty result"
-                continue
-            item = result[0]
-            timestamps = item.get("timestamp") or []
-            quote = (item.get("indicators", {}).get("quote") or [{}])[0]
-            if not timestamps or not quote:
-                last_error = "no timestamps/quote"
-                continue
-            df = pd.DataFrame({
-                "date": pd.to_datetime(timestamps, unit="s").date,
-                "open": quote.get("open"),
-                "high": quote.get("high"),
-                "low": quote.get("low"),
-                "close": quote.get("close"),
-                "volume": quote.get("volume"),
-            })
-            df = df.dropna(subset=["open", "high", "low", "close"])
-            if df.empty:
-                last_error = "empty normalized dataframe"
-                continue
-            df["ticker"] = symbol.upper()
-            df["value"] = pd.to_numeric(df["close"], errors="coerce") * pd.to_numeric(df["volume"], errors="coerce").fillna(0)
-            return normalize_external_history(df, symbol, is_index=is_index)
-        except Exception as e:
-            last_error = e
-            time.sleep(0.1)
-            continue
-    raise RuntimeError(f"Yahoo Chart API không trả dữ liệu cho {symbol}. Lỗi cuối: {last_error}")
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_history_yfinance(symbol: str, start: str, end: str, is_index: bool = False) -> pd.DataFrame:
-    """Yahoo fallback. Try direct Chart API first, then yfinance.download()."""
-    try:
-        return fetch_history_yahoo_chart(symbol, start, end, is_index=is_index)
-    except Exception as direct_error:
-        pass
-
-    try:
-        import yfinance as yf  # type: ignore
-    except Exception as e:
-        raise RuntimeError(f"Chưa cài yfinance: {e}")
-
-    candidates = [symbol]
-    if is_index:
-        candidates = ["^VNINDEX", "VNINDEX.VN", symbol]
-    else:
-        candidates = [f"{symbol}.VN", f"{symbol}.HN", symbol]
-
-    last_error = None
-    for ysym in candidates:
-        try:
-            df = yf.download(ysym, start=start, end=end, interval="1d", progress=False, auto_adjust=False, timeout=12)
-            if df is None or df.empty:
-                continue
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [c[0] for c in df.columns]
-            df = df.reset_index()
-            out = normalize_external_history(df, symbol, is_index=is_index)
-            if not out.empty:
-                return out
-        except Exception as e:
-            last_error = e
-            continue
-    raise RuntimeError(f"Yahoo không trả dữ liệu cho {symbol}. Lỗi cuối: {last_error}")
-
-
-def fetch_one_symbol(symbol: str, start: str, end: str, provider: str, vnstock_source: str) -> Tuple[pd.DataFrame, Optional[str]]:
-    """Fetch one equity, with graceful fallback."""
-    try:
-        if provider == "Vnstock":
-            return fetch_history_vnstock(symbol, start, end, vnstock_source, is_index=False), None
-        if provider == "Yahoo":
-            return fetch_history_yfinance(symbol, start, end, is_index=False), None
-        # Auto fallback: try Vnstock first, then Yahoo.
-        try:
-            return fetch_history_vnstock(symbol, start, end, vnstock_source, is_index=False), None
-        except Exception:
-            return fetch_history_yfinance(symbol, start, end, is_index=False), None
-    except Exception as e:
-        return pd.DataFrame(), f"{symbol}: {e}"
-
-
-def fetch_index_auto(start: str, end: str, provider: str, vnstock_source: str) -> Tuple[pd.DataFrame, Optional[str]]:
-    try:
-        if provider == "Vnstock":
-            return fetch_history_vnstock("VNINDEX", start, end, vnstock_source, is_index=True), None
-        if provider == "Yahoo":
-            return fetch_history_yfinance("VNINDEX", start, end, is_index=True), None
-        try:
-            return fetch_history_vnstock("VNINDEX", start, end, vnstock_source, is_index=True), None
-        except Exception:
-            return fetch_history_yfinance("VNINDEX", start, end, is_index=True), None
-    except Exception as e:
-        return pd.DataFrame(), f"VNINDEX: {e}"
-
-
-
-def build_synthetic_market_index(prices: pd.DataFrame) -> pd.DataFrame:
-    """Build a robust VNINDEX fallback from downloaded equities.
-
-    Some cloud sessions/providers may not return VNINDEX. Instead of stopping the app,
-    we build a broad-market proxy from the same tickers that were successfully loaded.
-    Each ticker is rebased to 100 at its first valid observation; the synthetic index is
-    the daily average of these normalized paths, scaled near 1200 for readability.
-    """
-    if prices is None or prices.empty:
-        return pd.DataFrame()
-    x = prices.copy()
-    x["date"] = pd.to_datetime(x["date"], errors="coerce")
-    x = x.dropna(subset=["date", "ticker", "open", "high", "low", "close"])
-    if x.empty:
-        return pd.DataFrame()
-
-    frames = []
-    for field in ["open", "high", "low", "close"]:
-        pv = x.pivot_table(index="date", columns="ticker", values=field, aggfunc="last").sort_index()
-        # Require at least a few tickers for a meaningful proxy when possible.
-        valid_count = pv.notna().sum(axis=1)
-        pv = pv.loc[valid_count >= max(3, min(8, int(len(pv.columns) * 0.15)))]
-        if pv.empty:
-            continue
-        norm = pv.copy()
-        for c in norm.columns:
-            first_valid = norm[c].dropna()
-            if first_valid.empty or first_valid.iloc[0] == 0:
-                norm[c] = np.nan
-            else:
-                norm[c] = norm[c] / first_valid.iloc[0] * 1200.0
-        ser = norm.mean(axis=1, skipna=True).rename(field)
-        frames.append(ser)
-
-    if len(frames) < 4:
-        return pd.DataFrame()
-    out = pd.concat(frames, axis=1).reset_index()
-    vol = x.groupby("date")["volume"].sum().rename("volume").reset_index()
-    out = out.merge(vol, on="date", how="left")
-    # Ensure OHLC consistency for plotting/relative-strength calculations.
-    hi = out[["open", "high", "low", "close"]].max(axis=1)
-    lo = out[["open", "high", "low", "close"]].min(axis=1)
-    out["high"] = hi
-    out["low"] = lo
-    return preprocess_index(out[["date", "open", "high", "low", "close", "volume"]])
-
-def try_auto_list_symbols(limit: int = 120) -> List[str]:
-    """Best-effort listing. If the installed vnstock version changes API, fallback is used."""
-    candidates = []
-    try:
-        from vnstock import Listing  # type: ignore
-        listing = Listing()
-        for method_name in ["all_symbols", "symbols_by_exchange", "list_by_exchange"]:
-            if hasattr(listing, method_name):
-                method = getattr(listing, method_name)
-                try:
-                    df = method()
-                    if isinstance(df, pd.DataFrame):
-                        col = next((c for c in ["symbol", "ticker", "code"] if c in [str(x).lower() for x in df.columns]), None)
-                        if col is None:
-                            # find any object column that looks like ticker
-                            for c in df.columns:
-                                vals = df[c].dropna().astype(str).str.upper()
-                                if len(vals) and vals.str.match(r"^[A-Z]{3,4}$").mean() > 0.5:
-                                    col = c; break
-                        if col is not None:
-                            candidates.extend(df[col].dropna().astype(str).str.upper().tolist())
-                    elif isinstance(df, (list, tuple)):
-                        candidates.extend([str(x).upper() for x in df])
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    cleaned = []
-    seen = set()
-    for t in candidates:
-        t = t.strip().upper()
-        if 2 <= len(t) <= 5 and t.isalpha() and t not in seen:
-            seen.add(t); cleaned.append(t)
-    return cleaned[:limit] if cleaned else DEFAULT_TICKERS[:limit]
-
-
-def build_neutral_fundamentals(tickers: List[str]) -> pd.DataFrame:
-    """Use neutral fundamental score when automatic finance data is not configured.
-    This keeps the scanner fully automatic while not pretending to know BCTC if it was not fetched.
-    """
-    return preprocess_fundamentals(pd.DataFrame({"ticker": tickers}))
-
-
-def pct_change(series: pd.Series, periods: int) -> float:
-    if len(series) <= periods or series.iloc[-periods - 1] == 0:
-        return np.nan
-    return float(series.iloc[-1] / series.iloc[-periods - 1] - 1)
-
-
-def true_range(df: pd.DataFrame) -> pd.Series:
-    prev_close = df["close"].shift(1)
-    tr1 = df["high"] - df["low"]
-    tr2 = (df["high"] - prev_close).abs()
-    tr3 = (df["low"] - prev_close).abs()
-    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-
-def safe_round_price(x: float) -> float:
+def fmt(x):
     if pd.isna(x) or not np.isfinite(x):
-        return np.nan
-    if x >= 100:
-        return round(x, 1)
-    if x >= 10:
-        return round(x, 2)
-    return round(x, 3)
+        return ""
+    return f"{x:.1f}" if x >= 100 else f"{x:.2f}" if x >= 10 else f"{x:.3f}"
 
 
-def format_range(a: float, b: float) -> str:
-    if pd.isna(a) or pd.isna(b):
-        return "—"
-    return f"{safe_round_price(a)}–{safe_round_price(b)}"
+def frange(a, b):
+    return f"{fmt(a)}–{fmt(b)}" if np.isfinite(a) and np.isfinite(b) else ""
 
 
-def close_position(row: pd.Series) -> float:
-    rng = row["high"] - row["low"]
-    if rng <= 0:
-        return 0.5
-    return float((row["close"] - row["low"]) / rng)
+def yahoo_candidates(ticker: str) -> List[str]:
+    t = norm_ticker(ticker)
+    if t.startswith("^") or "." in t or "=" in t:
+        return [t]
+    # Yahoo dữ liệu VN không đồng nhất, thử nhiều suffix để tăng độ phủ.
+    return [f"{t}.VN", f"{t}.HN"]
 
 
-# -----------------------------
-# Demo data
-# -----------------------------
-def generate_demo_data(seed: int = 42) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    rng = np.random.default_rng(seed)
-    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=150)
-    tickers = ["ABC", "XYZ", "HHH", "KKK", "HPG", "SSI", "FPT", "VNM", "BID", "MBB"]
-    sectors = {
-        "ABC": "Thép",
-        "XYZ": "Chứng khoán",
-        "HHH": "Khu công nghiệp",
-        "KKK": "Bất động sản",
-        "HPG": "Thép",
-        "SSI": "Chứng khoán",
-        "FPT": "Công nghệ",
-        "VNM": "Tiêu dùng",
-        "BID": "Ngân hàng",
-        "MBB": "Ngân hàng",
-    }
-
-    # VNIndex synthetic
-    idx_price = 1180 + np.cumsum(rng.normal(0.8, 8, size=len(dates)))
-    idx_open = idx_price + rng.normal(0, 3, len(dates))
-    idx_high = np.maximum(idx_open, idx_price) + rng.uniform(2, 8, len(dates))
-    idx_low = np.minimum(idx_open, idx_price) - rng.uniform(2, 8, len(dates))
-    vnindex = pd.DataFrame(
-        {
-            "date": dates,
-            "open": idx_open,
-            "high": idx_high,
-            "low": idx_low,
-            "close": idx_price,
-            "volume": rng.integers(500_000_000, 900_000_000, len(dates)),
-            "value": rng.integers(12_000_000_000_000, 25_000_000_000_000, len(dates)),
-        }
-    )
-
-    rows = []
-    for t in tickers:
-        base = rng.uniform(15, 55)
-        noise = rng.normal(0, 0.35, len(dates))
-        drift = rng.normal(0.03, 0.05)
-        price = base + np.cumsum(noise + drift)
-
-        # shape special demo patterns in last 60 sessions
-        if t == "ABC":  # accumulation low base
-            price[-60:] = 25 + rng.normal(0, 0.45, 60)
-            price[-12:] += np.linspace(-0.2, 0.15, 12)
-        elif t == "XYZ":  # shakeout
-            price[-60:] = 18.8 + rng.normal(0, 0.38, 60)
-            price[-3] = 17.95
-            price[-2] = 18.55
-            price[-1] = 18.45
-        elif t == "HHH":  # already breakout
-            price[-60:-8] = 31 + rng.normal(0, 0.55, 52)
-            price[-8:] = np.linspace(31.5, 34.8, 8) + rng.normal(0, 0.25, 8)
-        elif t == "KKK":  # distribution after run
-            price[-70:-15] = 13 + np.linspace(0, 6, 55) + rng.normal(0, 0.2, 55)
-            price[-15:] = 19 + rng.normal(0, 0.8, 15)
-            price[-1] = price[-2] * 0.985
-        elif t == "SSI":
-            price[-60:] = 32 + np.linspace(0, 4, 60) + rng.normal(0, 0.5, 60)
-        elif t == "HPG":
-            price[-60:] = 28 + rng.normal(0, 0.6, 60)
-            price[-10:] = 27.5 + rng.normal(0, 0.35, 10)
-        elif t == "FPT":
-            price[-60:] = 95 + np.linspace(0, 5, 60) + rng.normal(0, 0.8, 60)
-
-        price = np.maximum(price, 3)
-        opens = price + rng.normal(0, 0.25, len(dates))
-        highs = np.maximum(opens, price) + rng.uniform(0.15, 0.9, len(dates))
-        lows = np.minimum(opens, price) - rng.uniform(0.15, 0.9, len(dates))
-        volume = rng.integers(500_000, 4_500_000, len(dates)).astype(float)
-
-        if t in ["ABC", "XYZ", "HHH", "KKK"]:
-            volume[-10:] *= rng.uniform(1.4, 2.3, 10)
-        if t == "XYZ":
-            volume[-3] *= 2.5
-        if t == "HHH":
-            volume[-5:] *= 2.0
-        if t == "KKK":
-            volume[-3:] *= 2.7
-
-        value = volume * price * 1000  # approximate VND if price in thousand VND
-        for i, d in enumerate(dates):
-            rows.append(
-                {
-                    "date": d,
-                    "ticker": t,
-                    "open": max(opens[i], 1),
-                    "high": max(highs[i], opens[i], price[i]),
-                    "low": max(min(lows[i], opens[i], price[i]), 1),
-                    "close": price[i],
-                    "volume": int(volume[i]),
-                    "value": float(value[i]),
-                    "sector": sectors[t],
-                }
-            )
-    prices = pd.DataFrame(rows)
-
-    fundamentals = pd.DataFrame(
-        [
-            {"ticker": "ABC", "revenue_growth_yoy": 18, "profit_growth_yoy": 35, "roe": 14, "debt_to_equity": 0.6, "operating_cashflow_positive": True, "expectation_score": 11},
-            {"ticker": "XYZ", "revenue_growth_yoy": 22, "profit_growth_yoy": 48, "roe": 13, "debt_to_equity": 0.4, "operating_cashflow_positive": True, "expectation_score": 12},
-            {"ticker": "HHH", "revenue_growth_yoy": 10, "profit_growth_yoy": 20, "roe": 11, "debt_to_equity": 0.8, "operating_cashflow_positive": True, "expectation_score": 9},
-            {"ticker": "KKK", "revenue_growth_yoy": -5, "profit_growth_yoy": -20, "roe": 4, "debt_to_equity": 2.2, "operating_cashflow_positive": False, "expectation_score": 3},
-            {"ticker": "HPG", "revenue_growth_yoy": 15, "profit_growth_yoy": 28, "roe": 10, "debt_to_equity": 0.7, "operating_cashflow_positive": True, "expectation_score": 10},
-            {"ticker": "SSI", "revenue_growth_yoy": 25, "profit_growth_yoy": 42, "roe": 12, "debt_to_equity": 0.5, "operating_cashflow_positive": True, "expectation_score": 13},
-            {"ticker": "FPT", "revenue_growth_yoy": 20, "profit_growth_yoy": 22, "roe": 25, "debt_to_equity": 0.3, "operating_cashflow_positive": True, "expectation_score": 10},
-            {"ticker": "VNM", "revenue_growth_yoy": 2, "profit_growth_yoy": 5, "roe": 18, "debt_to_equity": 0.2, "operating_cashflow_positive": True, "expectation_score": 4},
-            {"ticker": "BID", "revenue_growth_yoy": 8, "profit_growth_yoy": 12, "roe": 16, "debt_to_equity": 1.0, "operating_cashflow_positive": True, "expectation_score": 7},
-            {"ticker": "MBB", "revenue_growth_yoy": 12, "profit_growth_yoy": 18, "roe": 21, "debt_to_equity": 0.9, "operating_cashflow_positive": True, "expectation_score": 8},
-        ]
-    )
-    return preprocess_prices(prices), preprocess_index(vnindex), preprocess_fundamentals(fundamentals)
+# ============================================================
+# DATA LOADERS
+# ============================================================
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_yahoo_symbol(symbol: str, start: date, end: date) -> pd.DataFrame:
+    p1, p2 = unix(start), unix(end + timedelta(days=1))
+    enc = urllib.parse.quote(symbol, safe="")
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{enc}?period1={p1}&period2={p2}&interval=1d&events=history"
+    r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
+    r.raise_for_status()
+    js = r.json()
+    result = js.get("chart", {}).get("result")
+    if not result:
+        err = js.get("chart", {}).get("error")
+        raise ValueError(f"No data: {err}")
+    item = result[0]
+    ts = item.get("timestamp") or []
+    q = (item.get("indicators", {}).get("quote") or [{}])[0]
+    if not ts or not q:
+        raise ValueError("Empty timestamp/quote")
+    n = len(ts)
+    def arr(k):
+        v = q.get(k, []) or []
+        return v[:n] + [np.nan] * max(0, n - len(v))
+    df = pd.DataFrame({
+        "date": [datetime.fromtimestamp(x).date() for x in ts],
+        "open": arr("open"), "high": arr("high"), "low": arr("low"),
+        "close": arr("close"), "volume": arr("volume"),
+    }).dropna(subset=["open", "high", "low", "close"])
+    if df.empty:
+        raise ValueError("Empty frame")
+    df["date"] = pd.to_datetime(df["date"])
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    return df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
 
 
-# -----------------------------
-# Scoring engines
-# -----------------------------
-def score_fundamentals(ticker: str, fundamentals: pd.DataFrame) -> Tuple[float, List[str]]:
-    """Score fundamentals + expectations out of 15."""
-    notes: List[str] = []
-    if fundamentals.empty or ticker not in set(fundamentals["ticker"]):
-        return 7.0, ["Chưa có file nền tảng/kỳ vọng: tạm cho điểm trung tính 7/15."]
-
-    row = fundamentals.loc[fundamentals["ticker"] == ticker].iloc[-1]
-    score = 0.0
-
-    rev = row.get("revenue_growth_yoy", np.nan)
-    prof = row.get("profit_growth_yoy", np.nan)
-    roe = row.get("roe", np.nan)
-    debt = row.get("debt_to_equity", np.nan)
-    ocf = bool(row.get("operating_cashflow_positive", False))
-    exp = row.get("expectation_score", np.nan)
-
-    if pd.notna(rev):
-        if rev > 20:
-            score += 2.0; notes.append("Doanh thu tăng mạnh YoY.")
-        elif rev > 5:
-            score += 1.3; notes.append("Doanh thu tăng YoY.")
-        elif rev >= 0:
-            score += 0.6; notes.append("Doanh thu đi ngang/tăng nhẹ.")
-        else:
-            notes.append("Doanh thu giảm YoY.")
-
-    if pd.notna(prof):
-        if prof > 30:
-            score += 3.0; notes.append("Lợi nhuận tăng mạnh YoY.")
-        elif prof > 10:
-            score += 2.0; notes.append("Lợi nhuận tăng YoY.")
-        elif prof > 0:
-            score += 1.0; notes.append("Lợi nhuận tăng nhẹ.")
-        else:
-            notes.append("Lợi nhuận giảm hoặc chưa cải thiện.")
-
-    if pd.notna(roe):
-        if roe >= 18:
-            score += 2.0; notes.append("ROE tốt.")
-        elif roe >= 10:
-            score += 1.2; notes.append("ROE chấp nhận được.")
-        elif roe >= 5:
-            score += 0.5; notes.append("ROE thấp.")
-
-    if pd.notna(debt):
-        if debt <= 0.8:
-            score += 1.5; notes.append("Đòn bẩy tài chính tương đối an toàn.")
-        elif debt <= 1.5:
-            score += 0.8; notes.append("Đòn bẩy ở mức cần theo dõi.")
-        else:
-            notes.append("Nợ/vốn chủ cao, cần cảnh giác.")
-
-    if ocf:
-        score += 1.5; notes.append("Dòng tiền kinh doanh dương/cải thiện.")
-    else:
-        notes.append("Dòng tiền kinh doanh chưa tích cực.")
-
-    if pd.notna(exp):
-        # expectation_score input is 0-15 or 0-10; normalize conservatively
-        exp_norm = max(0.0, min(5.0, float(exp) / 15 * 5 if exp > 10 else float(exp) / 10 * 5))
-        score += exp_norm
-        if exp_norm >= 4:
-            notes.append("Kỳ vọng/câu chuyện tương lai mạnh.")
-        elif exp_norm >= 2.5:
-            notes.append("Có câu chuyện kỳ vọng ở mức vừa.")
-        else:
-            notes.append("Kỳ vọng tương lai chưa rõ.")
-
-    return min(score, 15.0), notes
+# ============================================================
+# LIVE PULSE HELPERS
+# ============================================================
+def vn_now() -> datetime:
+    return datetime.utcnow() + timedelta(hours=7)
 
 
-def compute_sector_returns(prices: pd.DataFrame, window: int = 20) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    for sector, g in prices.groupby("sector"):
-        returns = []
-        for _, tg in g.groupby("ticker"):
-            tg = tg.sort_values("date")
-            r = pct_change(tg["close"], window)
-            if pd.notna(r):
-                returns.append(r)
-        out[sector] = float(np.nanmedian(returns)) if returns else np.nan
+def vn_market_status(now: datetime | None = None) -> Tuple[str, str]:
+    now = now or vn_now()
+    wd = now.weekday()  # Mon=0
+    hm = now.hour * 60 + now.minute
+    if wd >= 5:
+        return "Cuối tuần", "VN đóng cửa nhưng vĩ mô/thế giới vẫn biến động. Ưu tiên theo dõi Live Macro Pulse."
+    if 9*60 <= hm <= 11*60+30:
+        return "Đang giao dịch sáng", "Có thể dùng để canh đỏ/rung lắc trong phiên."
+    if 13*60 <= hm <= 15*60:
+        return "Đang giao dịch chiều", "Ưu tiên quan sát phản ứng cuối phiên và giữ nền."
+    if hm < 9*60:
+        return "Trước giờ mở cửa", "Dùng để chuẩn bị watchlist, chưa vội đặt mua."
+    if 11*60+30 < hm < 13*60:
+        return "Nghỉ trưa", "Đánh giá lại biến động sáng, chờ phiên chiều xác nhận."
+    return "Sau giờ đóng cửa", "Phù hợp chạy scan cuối ngày và lập kế hoạch mua đỏ ngày kế tiếp."
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_yahoo_intraday_symbol(symbol: str, range_str: str = "5d", interval: str = "5m") -> pd.DataFrame:
+    enc = urllib.parse.quote(symbol, safe="")
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{enc}?range={range_str}&interval={interval}&includePrePost=false"
+    r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
+    r.raise_for_status()
+    js = r.json()
+    result = js.get("chart", {}).get("result")
+    if not result:
+        raise ValueError(str(js.get("chart", {}).get("error")))
+    item = result[0]
+    ts = item.get("timestamp") or []
+    q = (item.get("indicators", {}).get("quote") or [{}])[0]
+    closes = q.get("close") or []
+    opens = q.get("open") or []
+    highs = q.get("high") or []
+    lows = q.get("low") or []
+    vols = q.get("volume") or []
+    n = min(len(ts), len(closes))
+    if n == 0:
+        raise ValueError("empty intraday")
+    df = pd.DataFrame({
+        "time": [datetime.fromtimestamp(x) for x in ts[:n]],
+        "open": opens[:n] + [np.nan] * max(0, n - len(opens)),
+        "high": highs[:n] + [np.nan] * max(0, n - len(highs)),
+        "low": lows[:n] + [np.nan] * max(0, n - len(lows)),
+        "close": closes[:n],
+        "volume": vols[:n] + [0] * max(0, n - len(vols)),
+    }).dropna(subset=["close"])
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.dropna(subset=["close"]).reset_index(drop=True)
+
+
+def live_macro_pulse() -> Tuple[pd.DataFrame, Dict[str, str]]:
+    rows, errors = [], {}
+    for name, sym in MACRO.items():
+        try:
+            df = fetch_yahoo_intraday_symbol(sym, "5d", "5m")
+            if df.empty or len(df) < 2:
+                continue
+            last = float(df.close.iloc[-1])
+            prev = float(df.close.iloc[-2])
+            day_ref = float(df.close.iloc[max(0, len(df)-79)]) if len(df) > 80 else float(df.close.iloc[0])
+            chg_5m = (last / prev - 1) * 100 if prev else 0
+            chg_live = (last / day_ref - 1) * 100 if day_ref else 0
+            risk = "Trung tính"
+            if name == "VIX" and last > 25: risk = "Rủi ro cao"
+            elif name == "VIX" and last < 18: risk = "Thuận lợi"
+            elif name in ["WTI", "Brent", "DXY", "US10Y"] and chg_live > 1.2: risk = "Áp lực tăng"
+            elif name in ["S&P500","Nasdaq","DowJones","Nikkei","HangSeng","KOSPI","Taiwan","Singapore"] and chg_live > 0.6: risk = "Hỗ trợ"
+            elif name in ["S&P500","Nasdaq","DowJones","Nikkei","HangSeng","KOSPI","Taiwan","Singapore"] and chg_live < -0.8: risk = "Gây áp lực"
+            rows.append({"market": name, "symbol": sym, "last": round(last, 3), "chg_5m_%": round(chg_5m, 2), "chg_live_%": round(chg_live, 2), "state": risk})
+        except Exception as e:
+            errors[name] = str(e)[:120]
+    return pd.DataFrame(rows), errors
+
+
+NEWS_QUERIES = {
+    "Lạm phát/Fed/Lãi suất": "inflation OR CPI OR Federal Reserve OR interest rates stock market",
+    "Chiến tranh/Địa chính trị": "war OR sanctions OR missile OR geopolitical risk oil stock market",
+    "Dầu/Logistics": "oil prices OR Brent OR WTI OR shipping disruption market",
+    "Châu Á": "Asia stocks Nikkei Hang Seng Kospi Taiwan market",
+    "Việt Nam/VNIndex": "Vietnam stock market VNIndex foreign investors",
+}
+NEGATIVE_NEWS_WORDS = ["war","missile","attack","sanction","tariff","inflation","selloff","crash","recession","oil jumps","surge","pandemic","default","crisis"]
+POSITIVE_NEWS_WORDS = ["rally","gains","eases","cut rates","rate cut","stimulus","peace","deal","recovery","cooling inflation"]
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_google_news_rss(query: str, n: int = 5) -> List[Dict[str, str]]:
+    q = urllib.parse.quote(query)
+    url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+    r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=8)
+    r.raise_for_status()
+    root = ET.fromstring(r.content)
+    out = []
+    for item in root.findall(".//item")[:n]:
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        pub = (item.findtext("pubDate") or "").strip()
+        txt = title.lower()
+        shock = 0
+        shock += sum(1 for w in NEGATIVE_NEWS_WORDS if w in txt)
+        shock -= sum(1 for w in POSITIVE_NEWS_WORDS if w in txt)
+        out.append({"title": title, "published": pub, "shock_score": shock, "link": link})
     return out
 
 
-def scan_one_ticker(
-    tg: pd.DataFrame,
-    vnindex: pd.DataFrame,
-    fundamentals: pd.DataFrame,
-    sector_returns: Dict[str, float],
-    cfg: ScanConfig,
-) -> Optional[Dict]:
-    tg = tg.sort_values("date").reset_index(drop=True)
-    ticker = tg["ticker"].iloc[-1]
-    sector = tg["sector"].iloc[-1] if "sector" in tg.columns else "Unknown"
-    if len(tg) < cfg.min_sessions:
-        return None
+def collect_news_pulse(max_per_group: int = 4) -> pd.DataFrame:
+    rows = []
+    for group, query in NEWS_QUERIES.items():
+        try:
+            for x in fetch_google_news_rss(query, max_per_group):
+                x["group"] = group
+                rows.append(x)
+        except Exception as e:
+            rows.append({"group": group, "title": f"Không tải được RSS: {e}", "published": "", "shock_score": 0, "link": ""})
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    return df.sort_values(["shock_score", "published"], ascending=[False, False]).reset_index(drop=True)
 
-    # Align VNIndex by date
-    merged = tg[["date", "close"]].merge(vnindex[["date", "close"]].rename(columns={"close": "vn_close"}), on="date", how="left")
-    merged["vn_close"] = merged["vn_close"].ffill().bfill()
 
-    recent = tg.iloc[-cfg.base_window:].copy()
-    recent20 = tg.iloc[-cfg.short_window:].copy()
-    last = tg.iloc[-1]
-    prev = tg.iloc[-2]
+def inject_meta_refresh(seconds: int):
+    st.markdown(f"<meta http-equiv='refresh' content='{int(seconds)}'>", unsafe_allow_html=True)
 
-    tg["tr"] = true_range(tg)
-    atr = float(tg["tr"].rolling(cfg.atr_window).mean().iloc[-1])
-    if pd.isna(atr) or atr <= 0:
-        atr = float((recent["high"] - recent["low"]).mean())
-    atr = max(atr, 0.01)
 
-    avg_volume_20 = float(recent20["volume"].mean())
-    avg_volume_60 = float(recent["volume"].mean())
-    avg_value_20 = float(recent20["value"].mean()) if "value" in recent20 else float((recent20["close"] * recent20["volume"]).mean())
-    avg_value_60 = float(recent["value"].mean()) if "value" in recent else float((recent["close"] * recent["volume"]).mean())
+def fetch_one_ticker(ticker: str, days: int, end: date) -> Tuple[str, pd.DataFrame, str]:
+    start = end - timedelta(days=int(days * 1.9) + 45)
+    errors = []
+    for sym in yahoo_candidates(ticker):
+        try:
+            df = fetch_yahoo_symbol(sym, start, end)
+            if len(df) < max(55, min(110, days // 2)):
+                raise ValueError(f"too few rows {len(df)}")
+            t = norm_ticker(ticker)
+            df["ticker"] = t
+            df["sector"] = SECTOR_MAP.get(t, "Khác")
+            df["value"] = df["close"] * df["volume"]
+            return t, df, ""
+        except Exception as e:
+            errors.append(f"{sym}: {e}")
+    return norm_ticker(ticker), pd.DataFrame(), " | ".join(errors[:2])
 
-    # Liquidity filter: keep but flag if not passed
-    liquidity_pass = avg_value_20 >= cfg.min_avg_value_20
 
-    # Base detection using 10/90 quantiles to avoid one-day extremes
-    base_low = float(recent["low"].quantile(0.10))
-    base_high = float(recent["high"].quantile(0.90))
+def fetch_universe_parallel(tickers: List[str], days: int, end: date, max_n: int, workers: int = 8) -> Tuple[pd.DataFrame, List[str]]:
+    chosen = [norm_ticker(t) for t in tickers if norm_ticker(t)][:max_n]
+    rows, errs = [], []
+    prog = st.progress(0, text=f"Đang tải {len(chosen)} mã...")
+    done = 0
+    workers = int(max(1, min(workers, 12)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(fetch_one_ticker, t, days, end): t for t in chosen}
+        for fut in as_completed(futs):
+            t = futs[fut]
+            try:
+                name, df, err = fut.result()
+                if not df.empty:
+                    rows.append(df)
+                elif err:
+                    errs.append(f"{t}: {err}")
+            except Exception as e:
+                errs.append(f"{t}: {e}")
+            done += 1
+            prog.progress(done / max(1, len(chosen)), text=f"Đã xử lý {done}/{len(chosen)} mã | tải thành công {len(rows)}")
+    prog.empty()
+    if not rows:
+        return pd.DataFrame(), errs
+    return pd.concat(rows, ignore_index=True), errs
+
+
+def demo_data(tickers, days=180):
+    rng = np.random.default_rng(7)
+    dates = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=days)
+    rows = []
+    for i, t in enumerate(tickers):
+        px = (20 + i * 1.8) * np.cumprod(1 + rng.normal(0.0005, 0.017, len(dates)))
+        vol = rng.integers(500000, 10000000, len(dates)).astype(float)
+        if i % 5 == 0:
+            vol[-25:] *= rng.uniform(1.25, 2.2)
+        for d, c, v in zip(dates, px, vol):
+            o = c * (1 + rng.normal(0, 0.006))
+            h = max(o, c) * (1 + abs(rng.normal(0, 0.008)))
+            l = min(o, c) * (1 - abs(rng.normal(0, 0.008)))
+            rows.append([d, t, o, h, l, c, v, SECTOR_MAP.get(t, "Khác")])
+    df = pd.DataFrame(rows, columns="date ticker open high low close volume sector".split())
+    df["value"] = df["close"] * df["volume"]
+    return df
+
+
+def load_file(f):
+    if f is None:
+        return pd.DataFrame()
+    return pd.read_csv(f) if f.name.lower().endswith("csv") else pd.read_excel(f)
+
+
+def standardize_prices(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy(); df.columns = [str(c).strip().lower() for c in df.columns]
+    aliases = {
+        "ticker":["ticker","symbol","mã","ma","code"], "date":["date","ngày","ngay","time"],
+        "open":["open","o"], "high":["high","h"], "low":["low","l"], "close":["close","c","price"],
+        "volume":["volume","vol","kl"], "sector":["sector","ngành","nganh"],
+    }
+    ren = {}
+    for k, opts in aliases.items():
+        for o in opts:
+            if o in df.columns:
+                ren[o] = k; break
+    df = df.rename(columns=ren)
+    miss = {"date","ticker","open","high","low","close","volume"} - set(df.columns)
+    if miss:
+        raise ValueError(f"Thiếu cột {miss}")
+    df["date"] = pd.to_datetime(df["date"]); df["ticker"] = df["ticker"].map(norm_ticker)
+    for c in ["open","high","low","close","volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    if "sector" not in df:
+        df["sector"] = df["ticker"].map(SECTOR_MAP).fillna("Khác")
+    df["value"] = df["close"] * df["volume"]
+    return df.dropna(subset=["date","ticker","close"])
+
+# ============================================================
+# ANALYSIS ENGINE
+# ============================================================
+def enrich(d: pd.DataFrame) -> pd.DataFrame:
+    d = d.sort_values("date").copy()
+    d["ret5"] = d["close"].pct_change(5)
+    d["ret20"] = d["close"].pct_change(20)
+    d["ret60"] = d["close"].pct_change(60)
+    d["value"] = d["close"] * d["volume"]
+    d["vol20"] = d["volume"].rolling(20).mean(); d["val20"] = d["value"].rolling(20).mean(); d["val60"] = d["value"].rolling(60).mean()
+    tr = pd.concat([(d.high-d.low), (d.high-d.close.shift()).abs(), (d.low-d.close.shift()).abs()], axis=1).max(axis=1)
+    d["atr14"] = tr.rolling(14).mean()
+    mfm = ((d.close-d.low)-(d.high-d.close))/(d.high-d.low).replace(0, np.nan)
+    d["cmf20"] = (mfm.fillna(0)*d.volume).rolling(20).sum()/d.volume.rolling(20).sum().replace(0, np.nan)
+    d["obv"] = (np.sign(d.close.diff()).fillna(0)*d.volume).cumsum()
+    return d
+
+
+def market_proxy(prices):
+    p = prices.sort_values(["ticker","date"]).copy()
+    p["norm"] = p.groupby("ticker")["close"].transform(lambda s: s / s.iloc[0] if len(s) else s)
+    m = p.groupby("date")["norm"].mean().reset_index()
+    m["close"] = 1000 * m["norm"]
+    m["open"] = m.close.shift(1).fillna(m.close)
+    m["high"] = m[["open","close"]].max(axis=1); m["low"] = m[["open","close"]].min(axis=1); m["volume"] = 0
+    return m[["date","open","high","low","close","volume"]]
+
+
+def macro_gate(end_date, days, market):
+    score, notes, errs = 50.0, [], []
+    start = end_date - timedelta(days=int(days * 1.8) + 40)
+    for name, sym in MACRO.items():
+        try:
+            g = fetch_yahoo_symbol(sym, start, end_date)
+            if len(g) < 30:
+                continue
+            r5 = g.close.iloc[-1]/g.close.iloc[-6]-1 if len(g) >= 6 else 0
+            r20 = g.close.iloc[-1]/g.close.iloc[-21]-1 if len(g) >= 21 else 0
+            ma20 = g.close.tail(20).mean(); last = g.close.iloc[-1]
+            if name in ["S&P500","Nasdaq","DowJones","Nikkei","HangSeng","KOSPI","Taiwan","Singapore"]:
+                score += (1 if r5 > 0 else 0) + (1 if r20 > 0 else 0) + (1 if last > ma20 else 0)
+            if name == "VIX":
+                if last < 18: score += 6; notes.append("VIX thấp")
+                elif last > 25: score -= 10; notes.append("VIX cao")
+            if name in ["WTI","Brent"] and r20 > 0.12: score -= 3; notes.append(f"{name} tăng nhanh")
+            if name == "DXY":
+                if r20 > 0.03: score -= 5; notes.append("DXY tăng mạnh")
+                elif r20 < -0.02: score += 3
+            if name == "US10Y" and r20 > 0.06: score -= 4; notes.append("US10Y tăng")
+        except Exception as e:
+            errs.append(f"{name}: {e}")
+    if market is not None and len(market) >= 25:
+        m = market.sort_values("date")
+        r5 = m.close.iloc[-1]/m.close.iloc[-6]-1 if len(m) >= 6 else 0
+        r20 = m.close.iloc[-1]/m.close.iloc[-21]-1 if len(m) >= 21 else 0
+        score += 5 if r5 > 0 else -4 if r5 < -0.025 else 0
+        score += 5 if r20 > 0 else 0
+    score = clamp(score, 0, 100)
+    if score >= 72: gate, mode = "MỞ CỬA GIẢI NGÂN CÓ CHỌN LỌC", "Normal"
+    elif score >= 58: gate, mode = "MỞ MỘT PHẦN - CHỌN CORE/WATCH", "Reduced"
+    elif score >= 45: gate, mode = "THẬN TRỌNG - CHỈ THĂM DÒ NHỎ", "Small"
+    else: gate, mode = "ĐÓNG CỬA MUA MỚI - CHỜ THIÊN THỜI", "Off"
+    return {"macro_score":round(score,1), "macro_gate":gate, "risk_mode":mode, "notes":notes[:6], "errors":errs[:20]}
+
+
+def analyze_one(t, g, market, cfg):
+    d = enrich(g); last = d.iloc[-1]
+    bw = int(min(cfg["base_window"], max(30, len(d)-5)))
+    base = d.tail(bw)
+    close = float(last.close); base_low = float(base.low.min()); base_high = float(base.high.max())
     base_mid = (base_low + base_high) / 2
-    base_width = max(base_high - base_low, 0.01)
-    base_width_pct = base_width / base_mid if base_mid else np.nan
-    close = float(last["close"])
-    today_ret = float(close / prev["close"] - 1) if prev["close"] else 0
-    in_base = base_low - 0.5 * atr <= close <= base_high + 0.3 * atr
-    base_tight = base_width_pct <= cfg.max_base_width_pct
-    low_zone_upper = base_low + cfg.buy_zone_fraction * base_width
-    no_chase_level = base_low + cfg.no_chase_fraction * base_width
+    atr = float(last.atr14) if np.isfinite(last.atr14) and last.atr14 > 0 else max(close * 0.025, (base_high-base_low)/10)
+    base_range_pct = (base_high/base_low - 1) * 100 if base_low > 0 else 999
+    zA1 = base_low; zA2 = base_low + .18*(base_high-base_low)
+    zB1 = zA2; zB2 = base_low + .33*(base_high-base_low)
+    zC1 = zB2; zC2 = base_low + .45*(base_high-base_low)
+    stop = min(base_low - .5*atr, base_low * .985)
+    risk = (close/stop - 1)*100 if stop > 0 else np.nan
+    reward = (base_high/close - 1)*100 if close > 0 else np.nan
+    rr = reward/risk if risk and risk > 0 else np.nan
 
-    # Buy zones A/B/C: lower part of the base
-    zone_a_low = base_low
-    zone_a_high = base_low + 0.15 * base_width
-    zone_b_low = zone_a_high
-    zone_b_high = base_low + 0.35 * base_width
-    zone_c_low = zone_b_high
-    zone_c_high = base_low + 0.50 * base_width
+    # Relative strength vs market proxy
+    rs20 = 0.0; alpha = 50.0
+    if market is not None and len(market):
+        m = pd.merge(d[["date","close"]], market[["date","close"]].rename(columns={"close":"mclose"}), on="date", how="inner")
+        if len(m) >= 25:
+            rs20 = (m.close.iloc[-1]/m.close.iloc[-21]-1) - (m.mclose.iloc[-1]/m.mclose.iloc[-21]-1)
+            alpha = clamp(50 + 300 * rs20, 0, 100)
 
-    stop = min(base_low - cfg.stop_atr_buffer * atr, recent["low"].min() - 0.05 * atr)
-    # Avoid too-far stop if quantile base low is high; use structural base support with buffer
-    stop = min(stop, base_low - 0.25 * atr)
+    val20 = float(last.val20) if np.isfinite(last.val20) else 0
+    val60 = float(last.val60) if np.isfinite(last.val60) else 0
+    v5 = d.value.tail(5).mean()
+    vr5 = v5/val20 if val20 > 0 else 1
+    vr20 = val20/val60 if val60 > 0 else 1
+    cmf = float(last.cmf20) if np.isfinite(last.cmf20) else 0
+    recent = d.tail(20)
+    upv = recent.loc[recent.close >= recent.open, "value"].sum()/recent.value.sum() if recent.value.sum() > 0 else .5
+    obv_s = (d.obv.iloc[-1] - d.obv.iloc[-21])/max(1, abs(d.obv.iloc[-21])) if len(d) > 22 and d.obv.iloc[-21] != 0 else 0
+    mf = 0
+    mf += 6 if vr5 >= 1.25 else 4 if vr5 >= 1.05 else 2 if vr5 >= .85 else 0
+    mf += 5 if vr20 >= 1.2 else 3 if vr20 >= 1.0 else 1
+    mf += 5 if upv >= .58 else 3 if upv >= .52 else 1
+    mf += 5 if cmf >= .12 else 3 if cmf >= .03 else 0
+    mf += 4 if obv_s > 0 else 0
+    mf = clamp(mf, 0, 25)
+    mf_state = "Dòng tiền vào rõ" if mf >= 18 else "Dòng tiền tích lũy" if mf >= 13 else "Dòng tiền trung bình" if mf >= 8 else "Dòng tiền yếu"
 
-    # Relative strength
-    stock_r20 = pct_change(tg["close"], 20)
-    stock_r10 = pct_change(tg["close"], 10)
-    vn_r20 = pct_change(merged["vn_close"], 20)
-    vn_r10 = pct_change(merged["vn_close"], 10)
-    rs20 = stock_r20 - vn_r20 if pd.notna(stock_r20) and pd.notna(vn_r20) else np.nan
-    rs10 = stock_r10 - vn_r10 if pd.notna(stock_r10) and pd.notna(vn_r10) else np.nan
-    sector_r20 = sector_returns.get(sector, np.nan)
-    sector_rs = stock_r20 - sector_r20 if pd.notna(stock_r20) and pd.notna(sector_r20) else np.nan
-
-    # Market red/stock holds
-    last_vn_ret = float(vnindex["close"].iloc[-1] / vnindex["close"].iloc[-2] - 1) if len(vnindex) >= 2 else np.nan
-    market_red_holds = pd.notna(last_vn_ret) and last_vn_ret < -0.005 and today_ret > last_vn_ret + 0.006
-
-    # Anomaly / behavior detection
-    high_vol_today = last["volume"] > cfg.volume_anomaly_mult * avg_volume_20
-    very_high_vol_today = last["volume"] > cfg.strong_volume_mult * avg_volume_20
-    body_close_pos = close_position(last)
-    lower_wick = (min(last["open"], last["close"]) - last["low"]) / max(last["high"] - last["low"], 0.01)
-    closes_weak = body_close_pos < 0.45
-    closes_strong = body_close_pos > 0.62
-
-    # absorption in last 10 days: high volume but price does not collapse
-    last10 = tg.iloc[-10:].copy()
-    vol_ref = avg_volume_20
-    absorption_days = 0
-    shakeout_days = 0
-    low_volume_pullback_days = 0
-    for _, r in last10.iterrows():
-        r_ret = (r["close"] / tg.loc[tg["date"] < r["date"], "close"].iloc[-1] - 1) if len(tg.loc[tg["date"] < r["date"]]) else 0
-        r_pos = close_position(r)
-        near_support = r["low"] <= base_low + 0.25 * base_width
-        if r["volume"] > cfg.volume_anomaly_mult * vol_ref and r_ret > -0.025 and r["close"] >= base_low - 0.3 * atr:
-            absorption_days += 1
-        if r["low"] < base_low - 0.15 * atr and r["close"] > base_low and r["volume"] > 1.25 * vol_ref:
-            shakeout_days += 1
-        if r_ret < 0 and r["volume"] < 0.85 * vol_ref and r["close"] >= base_low:
-            low_volume_pullback_days += 1
-
-    # Compression: recent 10-day range vs previous 20-day range
-    r10_range = (tg.iloc[-10:]["high"].max() - tg.iloc[-10:]["low"].min()) / close
-    r20_prev_range = (tg.iloc[-30:-10]["high"].max() - tg.iloc[-30:-10]["low"].min()) / close if len(tg) >= 30 else np.nan
-    compression = pd.notna(r20_prev_range) and r10_range < 0.75 * r20_prev_range
-
-    # Breakout / distribution
-    prior_high = float(tg.iloc[-cfg.base_window - 1 : -1]["high"].max()) if len(tg) > cfg.base_window + 1 else float(recent["high"].max())
-    breakout = close > prior_high and high_vol_today and closes_strong
-    runup_60 = pct_change(tg["close"], 60)
-    far_from_base_low = (close - base_low) / base_width if base_width else 0
-    distribution = (
-        (pd.notna(runup_60) and runup_60 > 0.20 and very_high_vol_today and closes_weak)
-        or (close > no_chase_level and very_high_vol_today and closes_weak)
-    )
-
-    # Money flow engine - V1.2
-    # Cổ phiếu muốn lên phải có dòng tiền. Vì vậy bản này chấm riêng dòng tiền dựa trên
-    # giá trị giao dịch, up-value/down-value, OBV, CMF và hành vi tiền vào trong nền.
-    recent5 = tg.iloc[-5:].copy()
-    avg_value_5 = float(recent5["value"].mean()) if "value" in recent5 else float((recent5["close"] * recent5["volume"]).mean())
-    value_ratio_5_20 = avg_value_5 / avg_value_20 if avg_value_20 > 0 else np.nan
-    value_ratio_20_60 = avg_value_20 / avg_value_60 if avg_value_60 > 0 else np.nan
-
-    flow_ref = tg.copy()
-    flow_ref["ret"] = flow_ref["close"].pct_change()
-    flow_ref["signed_volume"] = np.sign(flow_ref["ret"].fillna(0)) * flow_ref["volume"]
-    flow_ref["obv"] = flow_ref["signed_volume"].cumsum()
-    flow20 = flow_ref.iloc[-20:].copy()
-    up_value = float(flow20.loc[flow20["ret"] > 0, "value"].sum()) if "value" in flow20 else float((flow20.loc[flow20["ret"] > 0, "close"] * flow20.loc[flow20["ret"] > 0, "volume"]).sum())
-    down_value = float(flow20.loc[flow20["ret"] < 0, "value"].sum()) if "value" in flow20 else float((flow20.loc[flow20["ret"] < 0, "close"] * flow20.loc[flow20["ret"] < 0, "volume"]).sum())
-    up_value_ratio = up_value / (up_value + down_value) if (up_value + down_value) > 0 else np.nan
-    obv20_slope = (float(flow_ref["obv"].iloc[-1]) - float(flow_ref["obv"].iloc[-20])) / max(float(flow20["volume"].sum()), 1.0) if len(flow_ref) >= 20 else np.nan
-    hl_range = (flow20["high"] - flow20["low"]).replace(0, np.nan)
-    mf_mult = ((flow20["close"] - flow20["low"]) - (flow20["high"] - flow20["close"])) / hl_range
-    cmf20 = float((mf_mult.fillna(0) * flow20["volume"]).sum() / max(flow20["volume"].sum(), 1.0)) if len(flow20) else np.nan
-
-    money_flow_score = 0.0
-    money_notes: List[str] = []
-    if pd.notna(value_ratio_5_20):
-        if value_ratio_5_20 >= 1.30:
-            money_flow_score += 5; money_notes.append("Giá trị giao dịch 5 phiên tăng mạnh so với 20 phiên: tiền đang chú ý nhanh.")
-        elif value_ratio_5_20 >= 1.10:
-            money_flow_score += 3; money_notes.append("Giá trị giao dịch 5 phiên tăng so với 20 phiên.")
-    if pd.notna(value_ratio_20_60):
-        if value_ratio_20_60 >= 1.15:
-            money_flow_score += 5; money_notes.append("Giá trị giao dịch 20 phiên cao hơn 60 phiên: dòng tiền vào nền tăng dần.")
-        elif value_ratio_20_60 >= 1.00:
-            money_flow_score += 3; money_notes.append("Giá trị giao dịch 20 phiên không suy yếu so với 60 phiên.")
-    if pd.notna(up_value_ratio):
-        if up_value_ratio >= 0.58:
-            money_flow_score += 5; money_notes.append("Up-value chiếm ưu thế: tiền vào các phiên tăng nhiều hơn tiền ra các phiên giảm.")
-        elif up_value_ratio >= 0.52:
-            money_flow_score += 3; money_notes.append("Up-value hơi nhỉnh hơn down-value.")
-    if pd.notna(obv20_slope):
-        if obv20_slope >= 0.12:
-            money_flow_score += 4; money_notes.append("OBV 20 phiên tăng rõ: lực gom tích lũy cải thiện.")
-        elif obv20_slope > 0:
-            money_flow_score += 2; money_notes.append("OBV 20 phiên có xu hướng tăng nhẹ.")
-    if pd.notna(cmf20):
-        if cmf20 >= 0.08:
-            money_flow_score += 4; money_notes.append("CMF 20 dương rõ: dòng tiền đóng cửa về phía giá cao trong phiên.")
-        elif cmf20 > 0:
-            money_flow_score += 2; money_notes.append("CMF 20 dương nhẹ.")
-    if absorption_days >= 2 and in_base:
-        money_flow_score += 2; money_notes.append("Dòng tiền vào đi kèm hấp thụ cung trong nền.")
-    if high_vol_today and in_base and not no_chase_level < close:
-        money_flow_score += 1; money_notes.append("Phiên hiện tại có volume cao nhưng vẫn còn trong nền.")
-    money_flow_score = min(25.0, money_flow_score)
-
-    if money_flow_score >= 18:
-        money_flow_state = "Dòng tiền vào rõ"
-    elif money_flow_score >= 13:
-        money_flow_state = "Dòng tiền tích lũy"
-    elif money_flow_score >= 8:
-        money_flow_state = "Dòng tiền trung bình"
-    else:
-        money_flow_state = "Dòng tiền yếu/chưa rõ"
-
-    # Price location for red-base style
-    in_red_buy_zone = base_low <= close <= zone_b_high
-    in_zone_c = zone_c_low < close <= zone_c_high
-    is_red_day = today_ret <= cfg.red_day_threshold
-    no_chase = close > no_chase_level or today_ret > 0.025 or breakout
-    near_resistance = close >= base_high - 0.2 * atr
-
-    # Scoring A: Big money potential / liquidity / playground - 15
-    score_a = 0.0
-    notes: List[str] = []
-    warnings: List[str] = []
-    if liquidity_pass:
-        score_a += 5; notes.append("Thanh khoản/giá trị giao dịch đủ để dòng tiền lớn quan sát.")
-    else:
-        warnings.append("Thanh khoản dưới ngưỡng cấu hình; khó vào/ra quy mô lớn.")
-    if avg_value_20 > avg_value_60 * 1.10:
-        score_a += 3; notes.append("Giá trị giao dịch 20 phiên tăng so với 60 phiên.")
-    elif avg_value_20 > avg_value_60 * 0.85:
-        score_a += 1.5
-    if sector != "Unknown":
-        score_a += 2
-    if base_mid >= 8:  # avoid extreme penny; simple proxy
-        score_a += 2
-    if len(tg) >= cfg.min_sessions:
-        score_a += 3
-    score_a = min(score_a, 15)
-
-    # B: Accumulation / absorption - 25
-    score_b = 0.0
-    if in_base and base_tight:
-        score_b += 5; notes.append("Có nền giá tương đối rõ và chưa biến động quá rộng.")
-    elif in_base:
-        score_b += 3; notes.append("Giá còn nằm trong vùng nền nhưng nền chưa thật chặt.")
-    if compression:
-        score_b += 4; notes.append("Biên độ dao động đang siết lại.")
-    if absorption_days >= 2:
-        score_b += 6; notes.append(f"Có {absorption_days} phiên hấp thụ: volume tăng nhưng giá không giảm tương ứng.")
-    elif absorption_days == 1:
-        score_b += 3; notes.append("Có 1 phiên hấp thụ cung đáng chú ý.")
-    if shakeout_days >= 1:
-        score_b += 5; notes.append("Có tín hiệu rũ cung/false breakdown quanh nền.")
-    if low_volume_pullback_days >= 2:
-        score_b += 3; notes.append("Các nhịp đỏ gần đây có volume thấp, cung bán suy yếu.")
-    if close >= base_low and close <= base_high:
-        score_b += 2
-    score_b = min(score_b, 25)
-
-    # C: Relative strength - 15
-    score_c = 0.0
-    if pd.notna(rs20) and rs20 > 0:
-        score_c += 5; notes.append("Mạnh hơn VNIndex trong 20 phiên.")
-    if pd.notna(rs10) and rs10 > 0:
-        score_c += 3; notes.append("Mạnh hơn VNIndex trong 10 phiên.")
-    if market_red_holds:
-        score_c += 4; notes.append("Thị trường đỏ nhưng cổ phiếu giữ giá tốt hơn.")
-    if pd.notna(sector_rs) and sector_rs > 0:
-        score_c += 3; notes.append("Mạnh hơn trung bình ngành.")
-    score_c = min(score_c, 15)
-
-    # D: Red-base setup - 20
-    score_d = 0.0
-    if in_red_buy_zone:
-        score_d += 7; notes.append("Giá đang ở vùng thấp của nền: phù hợp phong cách mua đỏ/mua nền.")
-    elif in_zone_c:
-        score_d += 4; notes.append("Giá ở nửa thấp của nền nhưng không còn vùng đẹp nhất.")
-    if is_red_day and in_base:
-        score_d += 4; notes.append("Phiên hiện tại đang đỏ/không xanh mạnh trong vùng nền.")
-    if lower_wick > 0.35 and close >= base_low:
-        score_d += 4; notes.append("Có rút chân quanh hỗ trợ nền.")
-    if not no_chase and not near_resistance:
-        score_d += 3
-    if atr / close < 0.06:
-        score_d += 2; notes.append("Biên độ rủi ro theo ATR không quá lớn.")
-    score_d = min(score_d, 20)
-
-    # E: Risk / no-chase - 10
-    score_e = 10.0
-    if no_chase:
-        score_e -= 4; warnings.append("Không mua xanh/đuổi: giá đã xa vùng mua đỏ hoặc tăng mạnh trong phiên.")
-    if near_resistance:
-        score_e -= 2; warnings.append("Giá đang sát kháng cự/đỉnh nền, không còn lợi thế mua thấp.")
-    if distribution:
-        score_e -= 6; warnings.append("Cảnh báo phân phối: volume lớn vùng cao nhưng giá yếu.")
-    if close < stop:
-        score_e -= 6; warnings.append("Giá đã thủng vùng dừng lỗ cấu trúc.")
-    score_e = max(0.0, min(score_e, 10.0))
-
-    # F: Fundamentals + expectations. In V1.2 this remains useful but is not allowed to dominate price/flow evidence.
-    score_f, f_notes = score_fundamentals(ticker, fundamentals)
-    notes.extend(f_notes)
-    notes.extend(money_notes[:8])
-
-    # V1.2 weighting: dòng tiền là lõi chính để lọc cổ phiếu muốn lên.
-    score_a_w = score_a / 15 * 10       # sân chơi/tay to quan tâm
-    score_b_w = score_b / 25 * 20       # gom hàng/hấp thụ
-    score_c_w = score_c / 15 * 10       # sức mạnh tương đối
-    score_d_w = score_d / 20 * 15       # setup mua đỏ
-    score_e_w = score_e                 # rủi ro/no-chase
-    score_f_w = score_f / 15 * 10       # nền tảng/kỳ vọng
-    score_g_w = money_flow_score        # dòng tiền, tối đa 25
-    total_score = min(100.0, score_a_w + score_b_w + score_c_w + score_d_w + score_e_w + score_f_w + score_g_w)
-
-    # Concentration score: dùng để lọc ra 2-3 cổ tốt nhất trong nhóm cổ phiếu tốt.
-    concentration_score = (
-        money_flow_score / 25 * 35 +
-        score_b / 25 * 25 +
-        score_d / 20 * 15 +
-        score_c / 15 * 10 +
-        score_e / 10 * 10 +
-        score_f / 15 * 5
-    )
-    if distribution or close < stop:
-        concentration_score -= 25
-    if no_chase:
-        concentration_score -= 10
-    if not liquidity_pass:
-        concentration_score -= 8
-    concentration_score = max(0.0, min(100.0, concentration_score))
-
-    if concentration_score >= 75 and money_flow_score >= 16 and not distribution and not no_chase:
-        concentration_label = "TOP CÔ ĐẶC"
-    elif concentration_score >= 65 and money_flow_score >= 13 and not distribution:
-        concentration_label = "Ứng viên tốt"
-    elif money_flow_score < 8:
-        concentration_label = "Loại do dòng tiền yếu"
-    else:
-        concentration_label = "Theo dõi"
-
-    # Phase classification
-    if distribution:
-        phase = "Cảnh báo phân phối"
-        signal = "Distribution Warning"
-        action = "Không mua mới"
-    elif close < stop:
-        phase = "Thủng nền/suy yếu"
-        signal = "Base Breakdown"
-        action = "Loại hoặc chờ tạo nền mới"
-    elif money_flow_score < 8 and in_base:
-        phase = "Nền thiếu dòng tiền"
-        signal = "Weak Money Flow"
-        action = "Theo dõi, chưa ưu tiên cô đặc"
-    elif breakout:
-        phase = "Đã kéo/breakout"
-        signal = "No Chase / Wait Retest"
-        action = "Không mua xanh; chờ retest/nền mới"
-    elif shakeout_days >= 1 and in_base and money_flow_score >= 8:
-        phase = "Rũ cung trong nền"
-        signal = "Shakeout Buy Zone"
-        action = "Canh mua đỏ/thăm dò nếu giữ nền"
-    elif absorption_days >= 2 and in_base and (in_red_buy_zone or in_zone_c) and money_flow_score >= 10:
-        phase = "Gom hàng trong nền"
-        signal = "Red Base Accumulation"
-        action = "Canh đỏ mua vùng nền thấp"
-    elif in_base and base_tight and money_flow_score >= 8:
-        phase = "Tạo nền/siết nền"
-        signal = "Early Watch"
-        action = "Theo dõi, chỉ mua khi về vùng thấp"
-    else:
-        phase = "Chưa rõ"
-        signal = "Neutral"
-        action = "Chờ tín hiệu rõ hơn"
-
-    # Risk/reward: target = base high for early base buy; stop below base
-    buy_ref = min(max(close, zone_a_low), zone_b_high) if in_red_buy_zone else (zone_b_high if close < zone_b_high else close)
-    target_1 = base_high
-    target_2 = base_high + 0.5 * base_width
-    risk = max(buy_ref - stop, 0.01)
-    reward = max(target_1 - buy_ref, 0.0)
-    rr = reward / risk if risk > 0 else np.nan
-
-    # Action-plan metrics for the user's preferred style: buy red/low in base, never chase green.
-    risk_pct_from_close = (close - stop) / close * 100 if close > 0 and pd.notna(stop) else np.nan
-    reward_pct_to_base_high = (base_high - close) / close * 100 if close > 0 and pd.notna(base_high) else np.nan
-    if close < zone_a_low:
-        distance_to_zone = f"dưới vùng A {abs((close / zone_a_low - 1) * 100):.1f}%"
-        current_position = "Dưới vùng mua - chỉ theo dõi hồi lại nền"
-    elif zone_a_low <= close <= zone_a_high:
-        distance_to_zone = "đang ở vùng A"
-        current_position = "Đẹp nhất nếu phiên đỏ và giữ nền"
-    elif zone_b_low <= close <= zone_b_high:
-        distance_to_zone = "đang ở vùng B"
-        current_position = "Có thể thăm dò nếu không xanh mạnh"
-    elif zone_c_low <= close <= zone_c_high:
-        distance_to_zone = "đang ở vùng C"
-        current_position = "Chỉ mua rất nhỏ nếu tín hiệu mạnh"
-    elif close > zone_b_high:
-        distance_to_zone = f"cao hơn vùng B {(close / zone_b_high - 1) * 100:.1f}%"
-        current_position = "Chờ rung lắc về vùng A/B"
-    else:
-        distance_to_zone = "ngoài vùng mua"
-        current_position = "Chờ tín hiệu rõ hơn"
-
-    if distribution:
-        action_decision = "TRÁNH MUA"
-        buy_trigger = "Không mở vị thế mới; chờ cổ phiếu tạo nền mới sau phân phối."
-        position_plan = "0% vị thế. Nếu đang nắm giữ, ưu tiên quản trị rủi ro theo hỗ trợ/cắt lỗ."
-    elif money_flow_score < 8:
-        action_decision = "CHƯA ƯU TIÊN - DÒNG TIỀN YẾU"
-        buy_trigger = "Chưa có bằng chứng dòng tiền đủ mạnh. Không cô đặc vốn vào mã này dù giá ở nền."
-        position_plan = "0% vị thế mới; chỉ theo dõi cho đến khi money flow cải thiện."
-    elif close < stop:
-        action_decision = "LOẠI/THEO DÕI LẠI SAU"
-        buy_trigger = "Nền đã bị vô hiệu; chỉ xem lại khi giá lấy lại nền và tạo nền mới."
-        position_plan = "Không trung bình giá xuống."
-    elif in_red_buy_zone and not no_chase:
-        action_decision = "CÓ THỂ CANH MUA ĐỎ"
-        buy_trigger = f"Chỉ mua khi giá đỏ/rung lắc trong {format_range(zone_a_low, zone_b_high)}, không đóng cửa dưới {safe_round_price(stop)}."
-        position_plan = "Thăm dò 30% ở vùng A; thêm 20-30% ở vùng B/rũ cung thành công; phần còn lại chờ nâng nền/retest."
-    elif in_zone_c and not no_chase:
-        action_decision = "CHỈ THĂM DÒ NHỎ"
-        buy_trigger = f"Chỉ mua nhỏ nếu có rút chân/hấp thụ rõ; ưu tiên chờ về {format_range(zone_a_low, zone_b_high)}."
-        position_plan = "Tối đa 10-20% vị thế vì giá không còn ở vùng đẹp nhất."
-    elif in_base and (score_b >= 12 or score_c >= 7):
-        action_decision = "CHỜ VỀ VÙNG MUA"
-        buy_trigger = f"Đặt cảnh báo khi giá về {format_range(zone_a_low, zone_b_high)}; không mua nếu xanh/sát kháng cự."
-        position_plan = "Chưa giải ngân; chuẩn bị kế hoạch mua đỏ khi về vùng thấp của nền."
-    elif breakout or no_chase:
-        action_decision = "KHÔNG ĐU XANH"
-        buy_trigger = "Không mua phiên kéo xanh/breakout; chỉ xem lại nếu retest nền mới với volume thấp."
-        position_plan = "0% vị thế mới theo phong cách mua đỏ."
-    else:
-        action_decision = "THEO DÕI"
-        buy_trigger = f"Chờ cổ phiếu tạo nền rõ hơn hoặc về vùng {format_range(zone_a_low, zone_b_high)}."
-        position_plan = "Chưa giải ngân."
-
-    # Confidence based on total + risk context
-    confidence = max(0, min(95, round(total_score * 0.8 + (10 if score_b >= 16 else 0) + (5 if score_c >= 8 else 0) - (10 if distribution else 0))))
-
-    # Output fields
-    not_buy_when = []
-    if close > no_chase_level:
-        not_buy_when.append(f"giá > {safe_round_price(no_chase_level)}")
-    if near_resistance:
-        not_buy_when.append(f"sát kháng cự {safe_round_price(base_high)}")
-    if today_ret > 0.025:
-        not_buy_when.append("nến xanh mạnh trong phiên")
-    if breakout:
-        not_buy_when.append("đã breakout/kéo xa, chờ retest")
-    if not not_buy_when:
-        not_buy_when.append(f"giá vượt {safe_round_price(no_chase_level)} hoặc xanh mạnh")
-
-    invalidation = f"Đóng cửa dưới {safe_round_price(stop)} hoặc thủng nền {safe_round_price(base_low)} với volume lớn."
-
+    vol20 = float(last.vol20) if np.isfinite(last.vol20) else 0
+    vol_ratio = float(last.volume/vol20) if vol20 > 0 else 1
+    close_pos = (last.close-last.low)/(last.high-last.low) if last.high > last.low else .5
+    in_base = base_low <= close <= base_high*1.01
+    low_part = close <= base_low + .4*(base_high-base_low)
+    too_far = close > base_low + .65*(base_high-base_low)
+    tight = base_range_pct <= cfg["max_base_range_pct"] and in_base
+    shake = last.low < base_low*1.01 and close_pos > .55 and vol_ratio >= cfg["volume_spike"]
+    absorb = vol_ratio >= cfg["volume_spike"] and last.close >= last.open*.985 and in_base
+    dist = close > base_mid and vol_ratio >= 1.8 and close_pos < .35 and base.close.iloc[-1]/base.close.iloc[0]-1 > .12
+    liq = 10 if val20 >= cfg["min_val"]*1e9 else 5 if val20 >= cfg["min_val"]*.5e9 else 0
+    base_score = 15 if tight else 8 if base_range_pct <= cfg["max_base_range_pct"] + 10 else 0
+    acc = (8 if absorb else 0) + (7 if shake else 0) + (5 if low_part else 0) + (5 if rs20 > 0 else 0)
+    no_chase = 10 if not too_far else 4
+    risk_score = 10 if risk <= 8 and rr >= 1.4 else 6 if risk <= 10 else 2
+    total = clamp(liq + base_score + acc + no_chase + risk_score + mf*1.2, 0, 100)
+    if dist: phase, sig = "Cảnh báo phân phối", "Distribution Warning"
+    elif shake: phase, sig = "Rũ cung trong nền", "Shakeout Buy Zone"
+    elif absorb: phase, sig = "Gom hàng trong nền", "Red Base Accumulation"
+    elif tight: phase, sig = "Tạo nền/siết nền", "Early Watch"
+    else: phase, sig = "Chưa rõ", "Watch only"
+    action = "TRÁNH MUA" if dist else "CHƯA ƯU TIÊN - DÒNG TIỀN YẾU" if mf < 8 else "CÓ THỂ CANH MUA ĐỎ" if close <= zB2 and close >= stop else "CHỈ THĂM DÒ NHỎ" if close <= zC2 else "KHÔNG ĐU XANH - CHỜ VỀ VÙNG" if too_far else "THEO DÕI - CHỜ RUNG LẮC"
+    conc = clamp(total*.42 + mf*1.9 + (8 if phase in ["Gom hàng trong nền","Rũ cung trong nền"] else 0) + (6 if close <= zB2 else 0) - (10 if dist else 0), 0, 100)
+    clabel = "CORE" if conc >= 78 and mf >= 15 and not dist else "WATCH" if conc >= 62 and mf >= 10 and not dist else "EARLY"
+    victory = clamp(.29*conc + .25*mf*4 + .20*alpha + .16*no_chase*10 + .10*risk_score*10, 0, 100)
+    vlabel = "ỨNG VIÊN VƯỢT THỊ TRƯỜNG MẠNH" if victory >= 80 else "ỨNG VIÊN TỐT" if victory >= 68 else "THEO DÕI" if victory >= 55 else "CHƯA ĐỦ CHUẨN"
+    why = [mf_state, phase]
+    if close <= zB2: why.append("Giá ở vùng mua đỏ")
+    if rs20 > 0: why.append("Mạnh hơn thị trường")
+    if too_far: why.append("Giá xa vùng mua")
+    if dist: why.append("Cảnh báo phân phối")
     return {
-        "date": last["date"],
-        "ticker": ticker,
-        "sector": sector,
-        "close": safe_round_price(close),
-        "score": round(total_score, 1),
-        "confidence": confidence,
-        "money_flow_score": round(money_flow_score, 1),
-        "money_flow_state": money_flow_state,
-        "concentration_score": round(concentration_score, 1),
-        "concentration_label": concentration_label,
-        "value_ratio_5_20": round(value_ratio_5_20, 2) if pd.notna(value_ratio_5_20) else np.nan,
-        "value_ratio_20_60": round(value_ratio_20_60, 2) if pd.notna(value_ratio_20_60) else np.nan,
-        "up_value_ratio_pct": round(up_value_ratio * 100, 1) if pd.notna(up_value_ratio) else np.nan,
-        "cmf20": round(cmf20, 3) if pd.notna(cmf20) else np.nan,
-        "phase": phase,
-        "signal": signal,
-        "action": action,
-        "action_decision": action_decision,
-        "current_position": current_position,
-        "distance_to_zone": distance_to_zone,
-        "buy_trigger": buy_trigger,
-        "position_plan": position_plan,
-        "target_near": safe_round_price(target_1),
-        "target_extended": safe_round_price(target_2),
-        "risk_pct_from_close": round(risk_pct_from_close, 2) if pd.notna(risk_pct_from_close) and np.isfinite(risk_pct_from_close) else np.nan,
-        "reward_pct_to_base_high": round(reward_pct_to_base_high, 2) if pd.notna(reward_pct_to_base_high) and np.isfinite(reward_pct_to_base_high) else np.nan,
-        "base_low": safe_round_price(base_low),
-        "base_high": safe_round_price(base_high),
-        "base_zone": format_range(base_low, base_high),
-        "buy_zone_a": format_range(zone_a_low, zone_a_high),
-        "buy_zone_b": format_range(zone_b_low, zone_b_high),
-        "buy_zone_c": format_range(zone_c_low, zone_c_high),
-        "red_buy_zone": format_range(zone_a_low, zone_b_high),
-        "stop_loss": f"<{safe_round_price(stop)}",
-        "stop_loss_value": safe_round_price(stop),
-        "no_buy_when": "; ".join(not_buy_when),
-        "invalidation": invalidation,
-        "rr_to_base_high": round(rr, 2) if pd.notna(rr) and np.isfinite(rr) else np.nan,
-        "avg_value_20": avg_value_20,
-        "avg_volume_20": avg_volume_20,
-        "atr": safe_round_price(atr),
-        "today_ret_pct": round(today_ret * 100, 2),
-        "rs20_pct": round(rs20 * 100, 2) if pd.notna(rs20) else np.nan,
-        "rs10_pct": round(rs10 * 100, 2) if pd.notna(rs10) else np.nan,
-        "score_a_big_money": round(score_a_w, 1),
-        "score_b_accumulation": round(score_b_w, 1),
-        "score_c_relative_strength": round(score_c_w, 1),
-        "score_d_red_setup": round(score_d_w, 1),
-        "score_e_risk": round(score_e_w, 1),
-        "score_f_fundamental_expectation": round(score_f_w, 1),
-        "score_g_money_flow": round(score_g_w, 1),
-        "notes": notes[:12],
-        "warnings": warnings[:8],
+        "ticker":t, "sector":g.sector.iloc[-1] if "sector" in g else SECTOR_MAP.get(t,"Khác"), "close":close,
+        "phase":phase, "signal":sig, "action_decision":action, "Điểm tổng":round(total,1),
+        "victory_score":round(victory,1), "victory_label":vlabel, "concentration_score":round(conc,1), "concentration_label":clabel,
+        "money_flow_score":round(mf,1), "money_flow_state":mf_state, "value_ratio_5_20":round(vr5,2), "value_ratio_20_60":round(vr20,2),
+        "up_value_ratio_pct":round(upv*100,1), "cmf20":round(cmf,3), "rs20_vs_market_pct":round(rs20*100,2),
+        "base_zone":frange(base_low,base_high), "red_buy_zone":frange(zA1,zB2), "buy_zone_A":frange(zA1,zA2), "buy_zone_B":frange(zB1,zB2), "buy_zone_C":frange(zC1,zC2),
+        "stop_loss":fmt(stop), "target_near":fmt(base_high), "risk_pct_from_close":round(risk,2) if np.isfinite(risk) else np.nan,
+        "reward_pct_to_base_high":round(reward,2) if np.isfinite(reward) else np.nan, "rr_to_base_high":round(rr,2) if np.isfinite(rr) else np.nan,
+        "no_buy_when":f"Không mua xanh/sát kháng cự {fmt(base_high)}; chờ về {frange(zA1,zB2)}",
+        "buy_trigger":f"Chỉ mua khi đỏ/rung lắc trong {frange(zA1,zB2)}, không đóng cửa dưới {fmt(stop)}",
+        "invalidation":f"Đóng cửa dưới {fmt(stop)} hoặc thủng nền với volume lớn",
+        "position_plan":"30% vùng A, thêm 20–30% nếu giữ nền/rũ cung; không trung bình giá xuống",
+        "why_focus":" | ".join(why), "distribution_warning":dist,
+        "_base_low":base_low, "_base_high":base_high, "_red_high":zB2, "_stop":stop,
     }
 
 
-def run_scan(prices: pd.DataFrame, vnindex: pd.DataFrame, fundamentals: pd.DataFrame, cfg: ScanConfig) -> Tuple[pd.DataFrame, Dict[str, Dict]]:
-    sector_returns = compute_sector_returns(prices, cfg.short_window)
-    rows: List[Dict] = []
-    details: Dict[str, Dict] = {}
-    for ticker, tg in prices.groupby("ticker"):
-        result = scan_one_ticker(tg, vnindex, fundamentals, sector_returns, cfg)
-        if result is not None:
-            rows.append({k: v for k, v in result.items() if k not in ["notes", "warnings"]})
-            details[ticker] = result
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out, details
-    # Prioritize actionable red-base opportunities, then score
-    phase_rank = {
-        "Rũ cung trong nền": 1,
-        "Gom hàng trong nền": 2,
-        "Tạo nền/siết nền": 3,
-        "Nền thiếu dòng tiền": 4,
-        "Đã kéo/breakout": 5,
-        "Chưa rõ": 6,
-        "Cảnh báo phân phối": 7,
-        "Thủng nền/suy yếu": 8,
-    }
-    out["phase_rank"] = out["phase"].map(phase_rank).fillna(9)
-    out = out.sort_values(["phase_rank", "concentration_score", "money_flow_score", "score", "rr_to_base_high"], ascending=[True, False, False, False, False]).drop(columns=["phase_rank"]).reset_index(drop=True)
-    return out, details
+def analyze_prices(prices, market, cfg):
+    rows, details, errors = [], {}, []
+    for t, g in prices.groupby("ticker"):
+        try:
+            gs = g.sort_values("date")
+            row = analyze_one(t, gs, market, cfg)
+            rows.append(row)
+            details[t] = enrich(gs)
+        except Exception as e:
+            errors.append(f"{t}: {e}")
+    return pd.DataFrame(rows), details, errors
 
 
-# -----------------------------
-# Plotting
-# -----------------------------
-def make_candlestick_chart(tg: pd.DataFrame, detail: Dict) -> go.Figure:
-    tg = tg.sort_values("date").tail(100)
-    fig = go.Figure()
-    fig.add_trace(
-        go.Candlestick(
-            x=tg["date"],
-            open=tg["open"],
-            high=tg["high"],
-            low=tg["low"],
-            close=tg["close"],
-            name="Giá",
-        )
-    )
-    # Add volume as bar on secondary y axis manually
-    fig.add_trace(
-        go.Bar(
-            x=tg["date"],
-            y=tg["volume"],
-            name="Volume",
-            yaxis="y2",
-            opacity=0.25,
-        )
-    )
+def sector_map_df(res):
+    if res.empty: return pd.DataFrame()
+    g = res.groupby("sector").agg(
+        so_ma=("ticker","count"), diem_dong_tien_tb=("money_flow_score","mean"),
+        diem_co_dac_tb=("concentration_score","mean"), ung_vien=("concentration_label", lambda s:int(s.isin(["CORE","WATCH"]).sum())),
+        rs20_tb=("rs20_vs_market_pct","mean"),
+    ).reset_index()
+    g["sector_state"] = np.where(g.diem_dong_tien_tb >= 15, "Ngành hút tiền", np.where(g.diem_dong_tien_tb >= 10, "Ngành tích lũy", "Ngành yếu/trung tính"))
+    return g.sort_values(["diem_dong_tien_tb","diem_co_dac_tb"], ascending=False)
 
-    base_low = detail["base_low"]
-    base_high = detail["base_high"]
-    stop = detail["stop_loss_value"]
-    # Parse zones
-    for y, label, dash in [
-        (base_low, "Đáy nền", "dot"),
-        (base_high, "Đỉnh nền", "dot"),
-        (stop, "Cắt lỗ", "dash"),
-    ]:
-        if pd.notna(y):
-            fig.add_hline(y=y, line_dash=dash, annotation_text=label, annotation_position="top left")
 
-    fig.update_layout(
-        height=560,
-        xaxis_rangeslider_visible=False,
-        yaxis=dict(title="Giá"),
-        yaxis2=dict(title="Volume", overlaying="y", side="right", showgrid=False, rangemode="tozero"),
-        margin=dict(l=10, r=10, t=40, b=10),
-        legend=dict(orientation="h"),
-    )
+def focus_df(res, macro, n):
+    r = res.copy(); mode = macro.get("risk_mode", "Normal")
+    if mode == "Off":
+        r["action_decision"] = "CHỜ THỊ TRƯỜNG - VĨ MÔ XẤU"; r["concentration_score"] *= .72
+    elif mode == "Small":
+        r.loc[r.action_decision.str.contains("CÓ THỂ|CHỈ", regex=True), "action_decision"] = "CHỈ THĂM DÒ NHỎ - CHỜ THIÊN THỜI"; r["concentration_score"] *= .86
+    c = r[~r.distribution_warning].sort_values(["victory_score","concentration_score","money_flow_score","rr_to_base_high"], ascending=False)
+    cols = ["ticker","sector","concentration_label","concentration_score","victory_score","victory_label","money_flow_score","money_flow_state","action_decision","phase","close","red_buy_zone","stop_loss","rr_to_base_high","why_focus"]
+    return c.head(n)[cols]
+
+
+def chart(g,row):
+    d = g.tail(110)
+    fig = go.Figure(go.Candlestick(x=d.date, open=d.open, high=d.high, low=d.low, close=d.close, name="Giá"))
+    for y, name, dash in [(row._base_low,"Đáy nền","dot"),(row._base_high,"Đỉnh nền","dot"),(row._red_high,"Mua đỏ tối đa","dash"),(row._stop,"Cắt lỗ","dash")]:
+        fig.add_hline(y=float(y), line_dash=dash, annotation_text=name)
+    fig.update_layout(height=520, xaxis_rangeslider_visible=False, margin=dict(l=10,r=10,t=30,b=10))
     return fig
 
+# ============================================================
+# UI
+# ============================================================
+st.title("Smart Money Red Base Scanner – Live Pulse MVP V1.7")
+st.caption("App sống theo thị trường: tự làm mới dữ liệu, theo dõi vĩ mô toàn cầu, tin tức cuối tuần và chỉ mở tín hiệu mua khi thiên thời không xấu.")
+with st.expander("Triết lý hệ thống"):
+    st.write("Không mua xanh/đu break. Ưu tiên cổ phiếu có dòng tiền, ngành có tiền, vĩ mô không xấu, giá ở vùng đỏ trong nền. Bản V1.7 thêm Live Pulse: tự refresh, theo dõi macro intraday và tin tức vĩ mô nóng kể cả cuối tuần.")
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-def main():
-    st.set_page_config(page_title="Smart Money Red Base Scanner", layout="wide")
-    st.title("Smart Money Red Base Scanner – Auto Data MVP V1.3 Focus 3 Money Flow")
-    st.caption("Tự tải dữ liệu thị trường, quét dấu hiệu tay to gom hàng, ưu tiên mua đỏ trong nền. Bản V1.3: thêm bản đồ dòng tiền theo ngành và bảng Focus 2-3 mã cuối cùng. Nếu bộ lọc quá gắt, app vẫn chọn ra các ứng viên tốt nhất để theo dõi nhưng gắn nhãn rõ cấp độ.")
+with st.sidebar:
+    st.header("0) Live Pulse")
+    auto_refresh = st.checkbox("Tự làm mới app khi đang mở", value=False)
+    refresh_sec = st.selectbox("Chu kỳ refresh", [60, 180, 300, 900, 1800], index=2, format_func=lambda x: f"{x//60} phút" if x>=60 else f"{x} giây")
+    show_live_macro = st.checkbox("Hiện Live Macro Pulse", value=True)
+    show_news_pulse = st.checkbox("Hiện tin tức vĩ mô nóng", value=True)
+    if auto_refresh:
+        inject_meta_refresh(refresh_sec)
+        st.caption(f"Đang tự refresh mỗi {refresh_sec//60 if refresh_sec>=60 else refresh_sec} {'phút' if refresh_sec>=60 else 'giây'} khi tab này còn mở.")
+    status, status_note = vn_market_status()
+    st.info(f"Giờ VN: {vn_now().strftime('%H:%M:%S %d/%m/%Y')} | {status}")
+    st.caption(status_note)
 
-    with st.expander("Triết lý hệ thống", expanded=False):
-        st.markdown(
-            """
-            **Mục tiêu:** phát hiện sớm cổ phiếu có dấu hiệu bất thường: hấp thụ cung, rũ cung, siết nền, mạnh hơn VNIndex, sau đó tính **vùng mua đỏ** và **vùng cắt lỗ khi thủng nền**.
-
-            **Không phải khuyến nghị đầu tư.** App chỉ là công cụ sàng lọc xác suất. Người dùng cần kiểm tra lại dữ liệu, tin tức, thanh khoản và quản trị vốn.
-            """
-        )
-
-    st.sidebar.header("1) Dữ liệu tự động")
-    st.sidebar.info("Bản chống treo: chạy 5–10 mã và 120–180 ngày trước. Nguồn mặc định là Yahoo Direct để tránh Vnstock/yfinance bị treo trên cloud.")
-    data_mode = st.sidebar.radio(
-        "Chọn nguồn dữ liệu",
-        ["Tự động: Yahoo", "Tự động: Vnstock → Yahoo fallback", "Tự động: Vnstock", "Upload thủ công", "Demo"],
-        index=0,
-    )
-
-    provider_map = {
-        "Tự động: Vnstock → Yahoo fallback": "Auto",
-        "Tự động: Vnstock": "Vnstock",
-        "Tự động: Yahoo": "Yahoo",
-    }
-    provider = provider_map.get(data_mode, "Auto")
-    vnstock_source = st.sidebar.selectbox("Nguồn Vnstock", ["VCI", "KBS"], index=0, disabled=not data_mode.startswith("Tự động"))
-
-    lookback_days = st.sidebar.slider("Số ngày lịch sử cần tải", 90, 420, 180, 30, disabled=not data_mode.startswith("Tự động"), help="Chạy nhanh: 120-180 ngày. Chỉ tăng khi app đã ổn.")
-    end_dt = st.sidebar.date_input("Ngày kết thúc", value=date.today(), disabled=not data_mode.startswith("Tự động"))
-    start_dt = end_dt - timedelta(days=int(lookback_days))
-
-    preset = st.sidebar.selectbox(
-        "Rổ mã tự quét",
-        ["Top thanh khoản mặc định", "VN30-like", "Tự lấy danh sách từ Vnstock nếu được", "Tự nhập mã"],
-        index=0,
-        disabled=not data_mode.startswith("Tự động"),
-    )
-    if preset == "VN30-like":
-        default_universe = VN30_LIKE_TICKERS
-    elif preset == "Tự lấy danh sách từ Vnstock nếu được":
-        default_universe = try_auto_list_symbols(120)
-    elif preset == "Tự nhập mã":
-        default_universe = ["HPG", "SSI", "FPT", "MBB", "TCB", "VCB", "VND", "VCI", "DGC", "KBC"]
+    st.header("1) Dữ liệu & độ bao phủ")
+    data_mode = st.radio("Nguồn dữ liệu", ["Tự động Yahoo Direct", "Upload thủ công", "Demo"], index=0)
+    universe_preset = st.selectbox("Rổ mã", ["Rộng 150+ mã thanh khoản/đại diện ngành", "Core 69 mã", "Tùy chỉnh"], index=0)
+    if universe_preset == "Rộng 150+ mã thanh khoản/đại diện ngành":
+        default_text = BROAD_180
+    elif universe_preset == "Core 69 mã":
+        default_text = CORE_69
     else:
-        default_universe = DEFAULT_TICKERS
+        default_text = CORE_69
+    ticker_text = st.text_area("Danh sách mã", default_text, height=150)
+    scan_mode = st.radio("Chế độ quét", ["Đãi cát 2 vòng - khuyên dùng", "Một vòng đầy đủ", "Test nhanh"], index=0)
+    end_date = st.date_input("Ngày kết thúc", value=date.today())
+    if scan_mode == "Đãi cát 2 vòng - khuyên dùng":
+        scan_limit = st.slider("Vòng 1: số mã quét rộng", 30, 180, 100, step=10)
+        quick_days = st.slider("Vòng 1: số ngày nhanh", 90, 180, 120, step=30)
+        deep_top = st.slider("Vòng 2: số mã phân tích sâu", 10, 60, 30, step=5)
+        deep_days = st.slider("Vòng 2: số ngày phân tích sâu", 150, 360, 240, step=30)
+    elif scan_mode == "Một vòng đầy đủ":
+        scan_limit = st.slider("Số mã quét", 10, 180, 60, step=10)
+        deep_days = st.slider("Số ngày lịch sử", 120, 420, 240, step=30)
+        quick_days = deep_days; deep_top = scan_limit
+    else:
+        scan_limit = st.slider("Số mã test", 5, 30, 10, step=5)
+        quick_days = 120; deep_days = 180; deep_top = scan_limit
+    workers = st.slider("Số luồng tải song song", 2, 12, 8, step=1)
+    run = st.button("🚀 Quét đãi cát tìm vàng", type="primary", use_container_width=True)
+    st.header("2) Cấu hình lọc")
+    min_val = st.number_input("GTGD bình quân 20 phiên tối thiểu (tỷ VND)", value=5.0, min_value=0.0, step=1.0)
+    base_window = st.slider("Số phiên xác định nền", 30, 90, 60, step=5)
+    volume_spike = st.slider("Ngưỡng volume bất thường", 1.1, 3.0, 1.5, step=.1)
+    max_base = st.slider("Biên độ nền tối đa (%)", 10, 45, 28, step=1)
+    focus_n = st.slider("Số mã cô đặc cuối", 2, 5, 3)
+    st.header("3) Thiên thời")
+    enable_macro = st.checkbox("Bật Macro Timing Gate", value=True)
+    macro_days = st.slider("Số ngày dữ liệu vĩ mô", 60, 260, 150, step=30)
+    up_file = None
+    if data_mode == "Upload thủ công":
+        up_file = st.file_uploader("Upload prices CSV/XLSX", type=["csv","xlsx","xls"])
+    st.info("Khuyên dùng: Đãi cát 2 vòng, 80–120 mã vòng 1, phân tích sâu 20–30 mã. Nếu nguồn chậm, giảm luồng còn 4–6.")
 
-    ticker_text = st.sidebar.text_area(
-        "Danh sách mã tự tải/quét",
-        value=", ".join(default_universe),
-        height=120,
-        disabled=not data_mode.startswith("Tự động"),
-        help="Có thể sửa trực tiếp: HPG, SSI, FPT... App sẽ tự tải giá từng mã và VNINDEX.",
-    )
-    max_symbols = st.sidebar.slider("Giới hạn số mã tải", 3, 60, min(10, len(parse_ticker_text(ticker_text)) or 10), 1, disabled=not data_mode.startswith("Tự động"), help="Chạy nhanh: 5-10 mã. Sau khi ổn mới tăng 20-30 mã.")
-    worker_count = st.sidebar.slider("Số luồng tải song song", 1, 5, 2, 1, disabled=not data_mode.startswith("Tự động"), help="Để 2 luồng cho ổn định trên Streamlit Cloud. Tăng cao dễ bị nguồn dữ liệu giới hạn.")
-
-    price_file = st.sidebar.file_uploader("Upload prices.csv/xlsx", type=["csv", "xlsx", "xls"], disabled=data_mode != "Upload thủ công")
-    index_file = st.sidebar.file_uploader("Upload vnindex.csv/xlsx", type=["csv", "xlsx", "xls"], disabled=data_mode != "Upload thủ công")
-    fundamental_file = st.sidebar.file_uploader("Upload fundamentals.csv/xlsx tùy chọn", type=["csv", "xlsx", "xls"], disabled=data_mode not in ["Upload thủ công"])
-
-    run_scan_now = True
-    if data_mode.startswith("Tự động"):
-        run_scan_now = st.sidebar.button("🚀 Chạy quét nhanh", type="primary", use_container_width=True)
-        st.sidebar.caption("Nếu app đứng lâu: bấm Stop ở góc phải, giảm còn 5 mã/120 ngày, rồi bấm Chạy quét nhanh lại.")
-
-    st.sidebar.header("2) Cấu hình quét")
-    min_value_bil = st.sidebar.number_input("GTGD bình quân 20 phiên tối thiểu (tỷ VND)", min_value=0.0, value=5.0, step=1.0)
-    base_window = st.sidebar.slider("Số phiên xác định nền", 30, 90, 60, 5)
-    volume_mult = st.sidebar.slider("Ngưỡng volume bất thường", 1.1, 3.0, 1.5, 0.1)
-    max_base_width_pct = st.sidebar.slider("Biên độ nền tối đa (%)", 10, 50, 28, 1) / 100
-
-    cfg = ScanConfig(
-        min_avg_value_20=min_value_bil * 1_000_000_000,
-        base_window=base_window,
-        volume_anomaly_mult=volume_mult,
-        max_base_width_pct=max_base_width_pct,
-    )
-
-    st.sidebar.header("3) Lọc cô đặc")
-    top_n_concentrated = st.sidebar.slider("Số mã cô đặc tốt nhất", 2, 5, 3, 1)
-    min_money_flow_for_top = st.sidebar.slider("Điểm dòng tiền tối thiểu", 0, 25, 10, 1, help="Muốn cô đặc thì không chọn mã thiếu dòng tiền. Mặc định 10/25 để không quá gắt khi quét ít mã.")
-    min_concentration_score = st.sidebar.slider("Điểm cô đặc tối thiểu", 0, 100, 55, 5)
-
-    if data_mode.startswith("Tự động") and not run_scan_now:
-        st.info("App đã sẵn sàng. Bấm **🚀 Chạy quét nhanh** ở thanh bên trái để bắt đầu tải dữ liệu. Mặc định chỉ chạy 10 mã/180 ngày để tránh treo trên Streamlit Cloud.")
-        st.stop()
-
-    try:
-        if data_mode == "Demo":
-            prices, vnindex, fundamentals = generate_demo_data()
-            st.info("Đang dùng dữ liệu demo để minh họa logic. Chuyển sang chế độ Tự động để app tự tải dữ liệu thị trường.")
-
-        elif data_mode == "Upload thủ công":
-            if price_file is None or index_file is None:
-                st.warning("Chế độ upload thủ công cần tối thiểu 2 file: prices và VNIndex. Nếu muốn app tự tải, đổi nguồn dữ liệu sang chế độ Tự động.")
-                st.stop()
-            prices = preprocess_prices(read_csv_excel(price_file))
-            vnindex = preprocess_index(read_csv_excel(index_file))
-            fundamentals = preprocess_fundamentals(read_csv_excel(fundamental_file)) if fundamental_file is not None else preprocess_fundamentals(None)
-
+# Live dashboard vẫn hiển thị ngay cả khi chưa bấm quét.
+if show_live_macro:
+    st.subheader("A) Live Macro Pulse – vĩ mô sống")
+    live_df, live_err = live_macro_pulse()
+    if not live_df.empty:
+        st.dataframe(live_df, use_container_width=True, hide_index=True)
+        bad = live_df[live_df["state"].isin(["Rủi ro cao", "Gây áp lực", "Áp lực tăng"])]
+        if len(bad):
+            st.warning("Có biến động vĩ mô gây áp lực: " + ", ".join(bad.market.astype(str).head(6).tolist()))
         else:
-            tickers = parse_ticker_text(ticker_text)[:max_symbols]
-            if not tickers:
-                st.warning("Chưa có mã nào để tải. Hãy nhập danh sách mã hoặc chọn rổ mặc định.")
-                st.stop()
-            start_str = pd.Timestamp(start_dt).strftime("%Y-%m-%d")
-            end_str = pd.Timestamp(end_dt + timedelta(days=1)).strftime("%Y-%m-%d")  # include end date for Yahoo-style APIs
+            st.success("Chưa thấy tín hiệu vĩ mô intraday quá xấu trong bảng Live Pulse.")
+    else:
+        st.info("Chưa tải được Live Macro Pulse. App vẫn có thể chạy scan daily.")
+    if live_err:
+        with st.expander("Lỗi một số mã vĩ mô live"):
+            st.write(live_err)
 
-            with st.spinner(f"Đang tự tải dữ liệu {len(tickers)} mã + VNINDEX từ {data_mode}..."):
-                # 1) Try VNINDEX, but do not stop if provider fails. Cloud providers often block or rename index symbols.
-                idx_df, idx_err = fetch_index_auto(start_str, end_str, provider, vnstock_source)
+if show_news_pulse:
+    st.subheader("B) Tin tức vĩ mô nóng – cuối tuần vẫn cập nhật")
+    news_df = collect_news_pulse(3)
+    if not news_df.empty:
+        st.dataframe(news_df[["group", "shock_score", "published", "title"]].head(18), use_container_width=True, hide_index=True)
+        shock_total = int(news_df["shock_score"].clip(lower=0).sum())
+        if shock_total >= 6:
+            st.error(f"News Shock cao ({shock_total}). Ưu tiên giảm tỷ trọng/chờ thị trường xác nhận.")
+        elif shock_total >= 3:
+            st.warning(f"News Shock trung bình ({shock_total}). Chỉ mua đỏ nhỏ và chọn CORE.")
+        else:
+            st.success("News Shock thấp. Không thấy cụm tin xấu nổi bật trong RSS hiện tại.")
 
-                # 2) Load equities. The scanner can still run if we later build a synthetic market proxy.
-                parts = []
-                failed = []
-                progress = st.progress(0, text="Đang tải mã song song...")
-                with ThreadPoolExecutor(max_workers=int(worker_count)) as executor:
-                    future_map = {
-                        executor.submit(fetch_one_symbol, t, start_str, end_str, provider, vnstock_source): t
-                        for t in tickers
-                    }
-                    pending = set(future_map.keys())
-                    done_count = 0
-                    total_timeout = max(35, len(tickers) * 8)
-                    waited = 0
-                    while pending and waited < total_timeout:
-                        done, pending = wait(pending, timeout=5, return_when=FIRST_COMPLETED)
-                        waited += 5
-                        for future in done:
-                            t = future_map[future]
-                            done_count += 1
-                            try:
-                                df_one, err = future.result(timeout=1)
-                            except Exception as e:
-                                df_one, err = pd.DataFrame(), f"{t}: {e}"
-                            if not df_one.empty:
-                                parts.append(df_one)
-                            if err:
-                                failed.append(err)
-                            progress.progress(done_count / len(tickers), text=f"Đã xử lý {done_count}/{len(tickers)} mã")
-                    for fut in pending:
-                        t = future_map[fut]
-                        fut.cancel()
-                        failed.append(f"{t}: nguồn dữ liệu quá chậm, đã bỏ qua để app không treo")
-                    if pending:
-                        st.warning(f"Có {len(pending)} mã tải quá chậm nên app đã bỏ qua thay vì treo.")
-                progress.empty()
+if not run:
+    st.info("Bấm nút quét để bắt đầu. Bản V1.7 vẫn cập nhật Live Macro/Tin tức ở trên khi app đang mở.")
+    st.stop()
 
-                if not parts:
-                    st.error("Không tải được mã cổ phiếu nào. Hãy thử đổi nguồn Vnstock KBS/VCI, dùng Yahoo fallback, hoặc kiểm tra Internet.")
-                    if failed:
-                        with st.expander("Chi tiết lỗi tải dữ liệu"):
-                            st.write(failed[:30])
-                    st.stop()
+tickers = parse_tickers(ticker_text)
+cfg = {"min_val":min_val, "base_window":base_window, "volume_spike":volume_spike, "max_base_range_pct":max_base}
+errors = []
 
-                prices = preprocess_prices(pd.concat(parts, ignore_index=True))
-
-                # 3) If VNINDEX failed, build a proxy index from the successfully downloaded universe.
-                if idx_df.empty:
-                    vnindex = build_synthetic_market_index(prices)
-                    if vnindex.empty:
-                        st.error(f"Không tự tải được VNINDEX và cũng không tạo được chỉ số thay thế. Lỗi VNINDEX: {idx_err}")
-                        st.stop()
-                    st.warning("VNINDEX không tải được từ nguồn online. App đã tự tạo 'Market Proxy Index' từ rổ mã tải thành công để vẫn quét được sức mạnh tương đối.")
-                    with st.expander("Xem lỗi VNINDEX gốc"):
-                        st.write(idx_err)
-                else:
-                    vnindex = idx_df
-
-                fundamentals = build_neutral_fundamentals(sorted(prices["ticker"].unique()))
-
-                st.success(f"Đã tự tải {prices['ticker'].nunique()} mã, {len(prices):,} dòng giá. Không cần upload file.")
-                if failed:
-                    st.warning(f"Có {len(failed)} mã không tải được. App bỏ qua các mã đó và vẫn quét phần còn lại.")
-                    with st.expander("Xem lỗi các mã không tải được"):
-                        st.write(failed[:80])
-                st.caption("BCTC/kỳ vọng đang để điểm trung tính nếu chưa có nguồn tự động ổn định. Bản này ưu tiên phát hiện dòng tiền, nền giá, rũ cung, vùng mua đỏ và cắt lỗ tự động.")
-
+if data_mode == "Demo":
+    prices = demo_data(tickers[:scan_limit], deep_days if scan_mode != "Đãi cát 2 vòng - khuyên dùng" else quick_days)
+    market = market_proxy(prices)
+    res, details, errs = analyze_prices(prices, market, cfg); errors += errs
+elif data_mode == "Upload thủ công":
+    try:
+        prices = standardize_prices(load_file(up_file))
     except Exception as e:
-        st.error(f"Lỗi đọc/tải dữ liệu: {e}")
-        st.stop()
+        st.error(f"Lỗi upload: {e}"); st.stop()
+    market = market_proxy(prices)
+    res, details, errs = analyze_prices(prices, market, cfg); errors += errs
+else:
+    if scan_mode == "Đãi cát 2 vòng - khuyên dùng":
+        st.subheader("Vòng 1: Quét rộng nhanh")
+        quick_prices, e1 = fetch_universe_parallel(tickers, quick_days, end_date, scan_limit, workers)
+        errors += e1
+        if quick_prices.empty:
+            st.error("Không tải được dữ liệu vòng 1. Hãy giảm số mã, giảm luồng, hoặc thử Demo/Upload.")
+            if errors:
+                with st.expander("Lỗi tải dữ liệu"): st.write(errors[:120])
+            st.stop()
+        quick_market = market_proxy(quick_prices)
+        quick_res, _, e_an = analyze_prices(quick_prices, quick_market, cfg); errors += e_an
+        if quick_res.empty:
+            st.error("Không có ứng viên sau vòng 1."); st.stop()
+        quick_res["quick_rank_score"] = quick_res["victory_score"]*.45 + quick_res["money_flow_score"]*2.0 + quick_res["concentration_score"]*.25
+        shortlist = quick_res.sort_values("quick_rank_score", ascending=False).head(deep_top).ticker.tolist()
+        st.success(f"Vòng 1 tải được {quick_prices.ticker.nunique()} mã. Chọn {len(shortlist)} mã tốt nhất để phân tích sâu.")
+        st.dataframe(quick_res.sort_values("quick_rank_score", ascending=False).head(20)[["ticker","sector","quick_rank_score","money_flow_score","victory_score","phase","red_buy_zone"]], use_container_width=True, hide_index=True)
 
-    scan_df, details = run_scan(prices, vnindex, fundamentals, cfg)
-
-    if scan_df.empty:
-        st.warning("Không có mã nào đủ dữ liệu để quét. Kiểm tra lại số phiên hoặc dữ liệu đầu vào.")
-        st.stop()
-
-    # Overview metrics
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Số mã đã quét", f"{len(scan_df)}")
-    c2.metric("Cơ hội mua đỏ", f"{scan_df['signal'].isin(['Red Base Accumulation', 'Shakeout Buy Zone']).sum()}")
-    c3.metric("Dòng tiền vào rõ/tích lũy", f"{scan_df['money_flow_state'].isin(['Dòng tiền vào rõ', 'Dòng tiền tích lũy']).sum()}")
-    c4.metric("Cảnh báo phân phối", f"{(scan_df['signal'] == 'Distribution Warning').sum()}")
-    c5.metric("Điểm cô đặc cao nhất", f"{scan_df['concentration_score'].max():.1f}")
-
-    st.subheader("Bản đồ dòng tiền theo ngành")
-    st.caption("Trước khi chọn mã cô đặc, xem ngành nào đang có tiền. Cổ tốt mà ngành không có tiền thì xác suất chạy thường thấp hơn.")
-    sector_flow_df = (
-        scan_df.groupby("sector", dropna=False)
-        .agg(
-            so_ma=("ticker", "count"),
-            diem_dong_tien_tb=("money_flow_score", "mean"),
-            diem_co_dac_tb=("concentration_score", "mean"),
-            diem_co_dac_max=("concentration_score", "max"),
-            ung_vien_mua_do=("action_decision", lambda x: x.isin(["CÓ THỂ CANH MUA ĐỎ", "CHỈ THĂM DÒ NHỎ", "CHỜ VỀ VÙNG MUA"]).sum()),
-        )
-        .reset_index()
-    )
-    sector_flow_df["sector_flow_rank"] = (
-        sector_flow_df["diem_dong_tien_tb"] * 0.45
-        + sector_flow_df["diem_co_dac_tb"] * 0.35
-        + sector_flow_df["ung_vien_mua_do"] * 3
-        + sector_flow_df["diem_co_dac_max"] * 0.20
-    )
-    sector_flow_df = sector_flow_df.sort_values("sector_flow_rank", ascending=False).head(8)
-    st.dataframe(
-        sector_flow_df,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "diem_dong_tien_tb": st.column_config.ProgressColumn("Dòng tiền TB", min_value=0, max_value=25),
-            "diem_co_dac_tb": st.column_config.ProgressColumn("Cô đặc TB", min_value=0, max_value=100),
-            "diem_co_dac_max": st.column_config.ProgressColumn("Cô đặc cao nhất", min_value=0, max_value=100),
-            "sector_flow_rank": st.column_config.NumberColumn("Xếp hạng ngành", format="%.1f"),
-        },
-    )
-
-    st.subheader("Focus 2-3 mã cuối cùng")
-    st.caption("Bảng này là lớp lọc cuối: ưu tiên dòng tiền, gom hàng, vị trí giá trong nền và rủi ro. Nếu bộ lọc nghiêm ngặt chỉ ra ít mã, app vẫn chọn thêm ứng viên tốt nhất để anh theo dõi, nhưng gắn nhãn cấp độ rõ ràng.")
-
-    avoid_actions = ["TRÁNH MUA", "LOẠI/THEO DÕI LẠI SAU"]
-    strict_mask = (
-        (scan_df["money_flow_score"] >= min_money_flow_for_top) &
-        (scan_df["concentration_score"] >= min_concentration_score) &
-        (~scan_df["action_decision"].isin(avoid_actions + ["CHƯA ƯU TIÊN - DÒNG TIỀN YẾU"]))
-    )
-    core_df = scan_df[strict_mask].copy()
-    core_df["selection_tier"] = "CORE - đủ dòng tiền & setup"
-
-    # Fallback thông minh: nếu chưa đủ 2-3 mã, vẫn lấy ứng viên tốt nhất trong nhóm không bị phân phối/thủng nền.
-    # Điều này giúp app đúng mục tiêu cô đặc: luôn trả về vài mã đáng theo dõi nhất, nhưng không làm giả tín hiệu mua.
-    fallback_mask = (
-        (~scan_df["action_decision"].isin(avoid_actions)) &
-        (~scan_df["phase"].isin(["Cảnh báo phân phối", "Thủng nền/suy yếu"]))
-    )
-    fallback_df = scan_df[fallback_mask].copy()
-    fallback_df = fallback_df[~fallback_df["ticker"].isin(core_df["ticker"].tolist())]
-    fallback_df["selection_tier"] = np.where(
-        fallback_df["money_flow_score"] >= 8,
-        "WATCH - ứng viên tốt nhất, chờ điểm mua/dòng tiền mạnh hơn",
-        "EARLY - theo dõi sớm, dòng tiền chưa đủ mạnh"
-    )
-
-    focus_df = pd.concat([core_df, fallback_df], ignore_index=True)
-    if not focus_df.empty:
-        tier_rank = {
-            "CORE - đủ dòng tiền & setup": 1,
-            "WATCH - ứng viên tốt nhất, chờ điểm mua/dòng tiền mạnh hơn": 2,
-            "EARLY - theo dõi sớm, dòng tiền chưa đủ mạnh": 3,
-        }
-        focus_df["tier_rank"] = focus_df["selection_tier"].map(tier_rank).fillna(9)
-        focus_df["why_focus"] = (
-            focus_df["money_flow_state"].astype(str) + " | " +
-            focus_df["phase"].astype(str) + " | " +
-            focus_df["current_position"].astype(str)
-        )
-        focus_df = focus_df.sort_values(
-            ["tier_rank", "concentration_score", "money_flow_score", "score", "rr_to_base_high"],
-            ascending=[True, False, False, False, False]
-        ).head(top_n_concentrated).drop(columns=["tier_rank"])
-        focus_df.insert(0, "rank", range(1, len(focus_df) + 1))
-
-    if focus_df.empty:
-        st.warning("Chưa có mã nào đủ điều kiện theo dõi cô đặc. Giảm số mã quá thấp hoặc dữ liệu chưa đủ có thể làm app không tìm được ứng viên.")
+        st.subheader("Vòng 2: Phân tích sâu top ứng viên")
+        prices, e2 = fetch_universe_parallel(shortlist, deep_days, end_date, len(shortlist), workers)
+        errors += e2
+        if prices.empty:
+            st.error("Vòng 2 không tải được dữ liệu. Dùng kết quả vòng 1 tạm thời.")
+            prices, market, res, details = quick_prices, quick_market, quick_res, {}
+            details = {t: enrich(g.sort_values("date")) for t, g in prices.groupby("ticker")}
+        else:
+            market = market_proxy(prices)
+            res, details, e3 = analyze_prices(prices, market, cfg); errors += e3
     else:
-        top_cols = [
-            "rank", "ticker", "sector", "selection_tier", "concentration_score", "money_flow_score", "money_flow_state",
-            "score", "action_decision", "phase", "close", "red_buy_zone", "stop_loss", "rr_to_base_high", "why_focus", "buy_trigger"
-        ]
-        st.dataframe(
-            focus_df[top_cols],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "concentration_score": st.column_config.ProgressColumn("Điểm cô đặc", min_value=0, max_value=100),
-                "money_flow_score": st.column_config.ProgressColumn("Điểm dòng tiền", min_value=0, max_value=25),
-                "score": st.column_config.ProgressColumn("Tổng điểm", min_value=0, max_value=100),
-                "rr_to_base_high": st.column_config.NumberColumn("R/R", format="%.2f"),
-            },
-        )
-        st.info("Cách dùng: chỉ ưu tiên giải ngân nếu mã nằm CORE/WATCH, giá về vùng mua đỏ và không thủng stop-loss. EARLY chỉ để theo dõi, chưa nên cô đặc vốn.")
+        prices, e1 = fetch_universe_parallel(tickers, deep_days, end_date, scan_limit, workers)
+        errors += e1
+        if prices.empty:
+            st.error("Không tải được dữ liệu cổ phiếu. Hãy giảm số mã, giảm luồng, thử Demo, hoặc upload file.")
+            if errors:
+                with st.expander("Lỗi tải"): st.write(errors[:120])
+            st.stop()
+        market = market_proxy(prices)
+        res, details, errs = analyze_prices(prices, market, cfg); errors += errs
 
-    st.subheader("Bảng hành động thực chiến")
-    st.caption("Ưu tiên đọc bảng này trước: app không khuyến nghị mua đuổi, chỉ đưa kế hoạch có điều kiện theo phong cách mua đỏ trong nền.")
-    only_actionable = st.toggle("Chỉ hiện mã có thể canh mua đỏ / chờ về vùng mua", value=False)
-    action_df = scan_df.copy()
-    if only_actionable:
-        action_df = action_df[action_df["action_decision"].isin(["CÓ THỂ CANH MUA ĐỎ", "CHỈ THĂM DÒ NHỎ", "CHỜ VỀ VÙNG MUA"])]
-    action_cols = [
-        "ticker", "sector", "concentration_score", "money_flow_score", "money_flow_state", "score", "confidence",
-        "action_decision", "phase", "close", "current_position", "red_buy_zone", "distance_to_zone",
-        "stop_loss", "risk_pct_from_close", "target_near", "reward_pct_to_base_high", "rr_to_base_high",
-        "buy_trigger", "no_buy_when",
-    ]
-    st.dataframe(
-        action_df[action_cols],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "concentration_score": st.column_config.ProgressColumn("Cô đặc", min_value=0, max_value=100),
-            "money_flow_score": st.column_config.ProgressColumn("Dòng tiền", min_value=0, max_value=25),
-            "score": st.column_config.ProgressColumn("Điểm", min_value=0, max_value=100),
-            "confidence": st.column_config.ProgressColumn("Độ tin cậy", min_value=0, max_value=100),
-            "risk_pct_from_close": st.column_config.NumberColumn("Rủi ro tới cắt lỗ %", format="%.2f"),
-            "reward_pct_to_base_high": st.column_config.NumberColumn("Dư địa tới đỉnh nền %", format="%.2f"),
-            "rr_to_base_high": st.column_config.NumberColumn("R/R", format="%.2f"),
-        },
-    )
+if res.empty:
+    st.error("Không đủ dữ liệu để phân tích."); st.stop()
 
-    st.subheader("Bảng quét tổng hợp")
-    display_cols = [
-        "ticker", "sector", "concentration_score", "money_flow_score", "money_flow_state", "score", "confidence",
-        "phase", "signal", "action", "close", "base_zone", "red_buy_zone", "buy_zone_a", "buy_zone_b",
-        "buy_zone_c", "stop_loss", "rr_to_base_high", "today_ret_pct", "rs20_pct", "value_ratio_5_20",
-        "value_ratio_20_60", "up_value_ratio_pct", "cmf20", "no_buy_when",
-    ]
-    st.dataframe(
-        scan_df[display_cols],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "concentration_score": st.column_config.ProgressColumn("Cô đặc", min_value=0, max_value=100),
-            "money_flow_score": st.column_config.ProgressColumn("Dòng tiền", min_value=0, max_value=25),
-            "score": st.column_config.ProgressColumn("Điểm", min_value=0, max_value=100),
-            "confidence": st.column_config.ProgressColumn("Độ tin cậy", min_value=0, max_value=100),
-            "rr_to_base_high": st.column_config.NumberColumn("R/R tới đỉnh nền", format="%.2f"),
-            "today_ret_pct": st.column_config.NumberColumn("% hôm nay", format="%.2f"),
-            "rs20_pct": st.column_config.NumberColumn("RS20 vs VNIndex %", format="%.2f"),
-            "value_ratio_5_20": st.column_config.NumberColumn("GTGD 5/20", format="%.2f"),
-            "value_ratio_20_60": st.column_config.NumberColumn("GTGD 20/60", format="%.2f"),
-            "up_value_ratio_pct": st.column_config.NumberColumn("Up-value %", format="%.1f"),
-            "cmf20": st.column_config.NumberColumn("CMF20", format="%.3f"),
-        },
-    )
+macro = macro_gate(end_date, macro_days, market) if enable_macro else {"macro_score":65,"macro_gate":"TẮT MACRO GATE","risk_mode":"Normal","notes":[],"errors":[]}
+# Nếu bật tin tức, đưa News Shock vào cổng thiên thời để app không báo mua khi cuối tuần có tin xấu lớn.
+try:
+    if show_news_pulse:
+        nd = collect_news_pulse(3)
+        shock_total = int(nd["shock_score"].clip(lower=0).sum()) if not nd.empty else 0
+        if shock_total >= 6:
+            macro["macro_score"] = round(max(0, macro["macro_score"] - 12), 1)
+            macro["macro_gate"] = "HẠ TÍN HIỆU DO NEWS SHOCK - CHỜ XÁC NHẬN"
+            macro["risk_mode"] = "Small" if macro["risk_mode"] != "Off" else "Off"
+            macro["notes"] = (macro.get("notes") or []) + [f"News Shock cao: {shock_total}"]
+        elif shock_total >= 3:
+            macro["macro_score"] = round(max(0, macro["macro_score"] - 5), 1)
+            macro["notes"] = (macro.get("notes") or []) + [f"News Shock trung bình: {shock_total}"]
+except Exception as e:
+    macro["errors"] = (macro.get("errors") or []) + [f"News pulse: {e}"]
 
-    # Download result
-    csv = scan_df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button("Tải kết quả scan CSV", data=csv, file_name="smart_money_red_base_scan.csv", mime="text/csv")
+st.success(f"Đã phân tích {res.ticker.nunique()} mã sau vòng lọc. Dữ liệu đang dùng: {len(prices):,} dòng giá.")
 
-    st.subheader("Chi tiết từng mã")
-    ticker_choice = st.selectbox("Chọn mã để xem chi tiết", scan_df["ticker"].tolist())
-    detail = details[ticker_choice]
-    tg = prices.loc[prices["ticker"] == ticker_choice].copy()
+st.caption(f"Cập nhật lần cuối theo giờ VN: {vn_now().strftime('%H:%M:%S %d/%m/%Y')}")
+st.subheader("1) Độ bao phủ & chất lượng dữ liệu")
+a,b,c,d = st.columns(4)
+a.metric("Mã đầu vào", len(tickers))
+b.metric("Mã tải/được phân tích", int(res.ticker.nunique()))
+c.metric("Mã lỗi/bỏ qua", len(errors))
+d.metric("Chế độ", scan_mode)
+if errors:
+    with st.expander("Mã lỗi / bị bỏ qua để biết độ phủ thực tế"):
+        st.write(errors[:200])
 
-    left, right = st.columns([1.45, 1])
-    with left:
-        st.plotly_chart(make_candlestick_chart(tg, detail), use_container_width=True)
+st.subheader("2) Thiên thời vĩ mô / Market Timing Gate")
+a,b,c = st.columns(3)
+a.metric("Macro Score", f"{macro['macro_score']}/100")
+b.metric("Cổng mua", macro["macro_gate"])
+c.metric("Chế độ rủi ro", macro["risk_mode"])
+if macro.get("notes"):
+    st.write(" | ".join(macro["notes"]))
+if macro.get("errors"):
+    with st.expander("Một số dữ liệu vĩ mô không tải được"):
+        st.write(macro["errors"])
+if show_live_macro:
+    with st.expander("Live Macro Pulse chi tiết"):
+        live_df2, live_err2 = live_macro_pulse()
+        if not live_df2.empty:
+            st.dataframe(live_df2, use_container_width=True, hide_index=True)
+        if live_err2:
+            st.write(live_err2)
+if show_news_pulse:
+    with st.expander("Tin tức vĩ mô nóng chi tiết"):
+        ndf2 = collect_news_pulse(4)
+        if not ndf2.empty:
+            st.dataframe(ndf2[["group", "shock_score", "published", "title", "link"]].head(25), use_container_width=True, hide_index=True)
 
-    with right:
-        st.markdown(f"### {ticker_choice} – {detail['phase']}")
-        st.markdown(f"**Điểm:** {detail['score']}/100  \n**Điểm cô đặc:** {detail['concentration_score']}/100  \n**Dòng tiền:** {detail['money_flow_score']}/25 – {detail['money_flow_state']}  \n**Độ tin cậy:** {detail['confidence']}%  \n**Tín hiệu:** {detail['signal']}  \n**Hành động:** {detail['action']}")
-        st.markdown("#### Dòng tiền")
-        st.write(f"- Trạng thái: **{detail['money_flow_state']}**")
-        st.write(f"- GTGD 5/20 phiên: **{detail['value_ratio_5_20']}x** | GTGD 20/60 phiên: **{detail['value_ratio_20_60']}x**")
-        st.write(f"- Up-value ratio: **{detail['up_value_ratio_pct']}%** | CMF20: **{detail['cmf20']}**")
-        st.markdown("#### Kế hoạch hành động")
-        st.write(f"- Quyết định hiện tại: **{detail['action_decision']}**")
-        st.write(f"- Vị trí giá hiện tại: **{detail['current_position']}**")
-        st.write(f"- Khoảng cách tới vùng mua: **{detail['distance_to_zone']}**")
-        st.write(f"- Điều kiện mua: **{detail['buy_trigger']}**")
-        st.write(f"- Kế hoạch tỷ trọng: **{detail['position_plan']}**")
-        st.write(f"- Rủi ro tới cắt lỗ: **{detail['risk_pct_from_close']}%** | Dư địa tới đỉnh nền: **{detail['reward_pct_to_base_high']}%** | R/R: **{detail['rr_to_base_high']}**")
-        st.markdown("#### Vùng giá")
-        st.write(f"- Vùng nền: **{detail['base_zone']}**")
-        st.write(f"- Vùng mua đỏ tổng: **{detail['red_buy_zone']}**")
-        st.write(f"- Vùng A đẹp nhất: **{detail['buy_zone_a']}**")
-        st.write(f"- Vùng B chấp nhận: **{detail['buy_zone_b']}**")
-        st.write(f"- Vùng C thăm dò: **{detail['buy_zone_c']}**")
-        st.write(f"- Cắt lỗ: **{detail['stop_loss']}**")
-        st.write(f"- Không mua khi: **{detail['no_buy_when']}**")
-        st.write(f"- Điều kiện vô hiệu: **{detail['invalidation']}**")
+st.subheader("3) Bản đồ dòng tiền theo ngành")
+sec = sector_map_df(res)
+st.dataframe(sec, use_container_width=True, hide_index=True, column_config={
+    "diem_dong_tien_tb": st.column_config.ProgressColumn("Điểm dòng tiền TB", min_value=0, max_value=25, format="%.1f"),
+    "diem_co_dac_tb": st.column_config.ProgressColumn("Điểm cô đặc TB", min_value=0, max_value=100, format="%.1f"),
+})
 
-        st.markdown("#### Điểm thành phần")
-        comp = pd.DataFrame(
-            [
-                ["Sân chơi/tay to quan tâm", detail["score_a_big_money"], 10],
-                ["Gom hàng/hấp thụ", detail["score_b_accumulation"], 20],
-                ["Sức mạnh tương đối", detail["score_c_relative_strength"], 10],
-                ["Setup mua đỏ", detail["score_d_red_setup"], 15],
-                ["Rủi ro/không mua đuổi", detail["score_e_risk"], 10],
-                ["Nền tảng & kỳ vọng", detail["score_f_fundamental_expectation"], 10],
-                ["Dòng tiền", detail["score_g_money_flow"], 25],
-            ],
-            columns=["Nhóm", "Điểm", "Tối đa"],
-        )
-        st.dataframe(comp, hide_index=True, use_container_width=True)
+st.subheader("4) Focus 2–3 mã cuối cùng")
+focus = focus_df(res, macro, focus_n)
+st.dataframe(focus, use_container_width=True, hide_index=True, column_config={
+    "concentration_score": st.column_config.ProgressColumn("Điểm cô đặc", min_value=0, max_value=100, format="%.1f"),
+    "victory_score": st.column_config.ProgressColumn("Điểm thắng TT", min_value=0, max_value=100, format="%.1f"),
+    "money_flow_score": st.column_config.ProgressColumn("Điểm dòng tiền", min_value=0, max_value=25, format="%.1f"),
+})
 
-    st.markdown("#### Bằng chứng")
-    if detail["notes"]:
-        for n in detail["notes"]:
-            st.write(f"- {n}")
-    else:
-        st.write("- Chưa có bằng chứng đủ mạnh.")
+st.subheader("5) Bảng hành động thực chiến")
+cols = ["ticker","sector","victory_score","victory_label","concentration_label","concentration_score","money_flow_score","money_flow_state","phase","signal","action_decision","close","base_zone","red_buy_zone","buy_zone_A","buy_zone_B","buy_zone_C","stop_loss","target_near","risk_pct_from_close","reward_pct_to_base_high","rr_to_base_high","rs20_vs_market_pct","why_focus"]
+st.dataframe(res.sort_values(["victory_score","concentration_score"], ascending=False)[cols], use_container_width=True, hide_index=True, column_config={
+    "victory_score": st.column_config.ProgressColumn("Điểm thắng TT", min_value=0, max_value=100, format="%.1f"),
+    "concentration_score": st.column_config.ProgressColumn("Điểm cô đặc", min_value=0, max_value=100, format="%.1f"),
+    "money_flow_score": st.column_config.ProgressColumn("Điểm dòng tiền", min_value=0, max_value=25, format="%.1f"),
+})
 
-    if detail["warnings"]:
-        st.markdown("#### Cảnh báo")
-        for w in detail["warnings"]:
-            st.warning(w)
+st.subheader("6) Kế hoạch từng mã")
+sel = st.selectbox("Chọn mã", res.sort_values("victory_score", ascending=False).ticker.tolist())
+r = res[res.ticker == sel].iloc[0]
+g = details.get(sel)
+if g is not None and len(g):
+    st.plotly_chart(chart(g, r), use_container_width=True)
+c1,c2,c3,c4 = st.columns(4)
+c1.metric("Giá hiện tại", fmt(r.close))
+c2.metric("Vùng mua đỏ", r.red_buy_zone)
+c3.metric("Cắt lỗ", r.stop_loss)
+c4.metric("R/R tới đỉnh nền", r.rr_to_base_high)
+st.markdown(f"""
+### {sel} — {r.victory_label}
+- **Quyết định:** {r.action_decision}
+- **Pha:** {r.phase}
+- **Dòng tiền:** {r.money_flow_state} ({r.money_flow_score}/25)
+- **Điều kiện mua:** {r.buy_trigger}
+- **Không mua khi:** {r.no_buy_when}
+- **Điều kiện vô hiệu:** {r.invalidation}
+- **Kế hoạch vị thế:** {r.position_plan}
+- **Lý do:** {r.why_focus}
+""")
 
-    with st.expander("Format dữ liệu đầu vào"):
-        st.markdown(
-            """
-            **prices.csv/xlsx** bắt buộc có cột:
-            `date, ticker, open, high, low, close, volume`  
-            Nên có thêm: `value, sector`.
-
-            **vnindex.csv/xlsx** bắt buộc có cột:
-            `date, open, high, low, close`  
-            Nên có thêm: `volume, value`.
-
-            **fundamentals.csv/xlsx** tùy chọn:
-            `ticker, revenue_growth_yoy, profit_growth_yoy, roe, debt_to_equity, operating_cashflow_positive, expectation_score`
-
-            `expectation_score` có thể chấm thủ công 0–10 hoặc 0–15 theo câu chuyện ngành/doanh nghiệp.
-            """
-        )
-
-
-if __name__ == "__main__":
-    main()
+st.subheader("7) Tải kết quả")
+csv = res.sort_values(["victory_score","concentration_score"], ascending=False).to_csv(index=False).encode("utf-8-sig")
+st.download_button("Tải CSV", data=csv, file_name="market_winner_v17_live_pulse_results.csv", mime="text/csv")
