@@ -334,6 +334,53 @@ def fetch_index_auto(start: str, end: str, provider: str, vnstock_source: str) -
         return pd.DataFrame(), f"VNINDEX: {e}"
 
 
+
+def build_synthetic_market_index(prices: pd.DataFrame) -> pd.DataFrame:
+    """Build a robust VNINDEX fallback from downloaded equities.
+
+    Some cloud sessions/providers may not return VNINDEX. Instead of stopping the app,
+    we build a broad-market proxy from the same tickers that were successfully loaded.
+    Each ticker is rebased to 100 at its first valid observation; the synthetic index is
+    the daily average of these normalized paths, scaled near 1200 for readability.
+    """
+    if prices is None or prices.empty:
+        return pd.DataFrame()
+    x = prices.copy()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce")
+    x = x.dropna(subset=["date", "ticker", "open", "high", "low", "close"])
+    if x.empty:
+        return pd.DataFrame()
+
+    frames = []
+    for field in ["open", "high", "low", "close"]:
+        pv = x.pivot_table(index="date", columns="ticker", values=field, aggfunc="last").sort_index()
+        # Require at least a few tickers for a meaningful proxy when possible.
+        valid_count = pv.notna().sum(axis=1)
+        pv = pv.loc[valid_count >= max(3, min(8, int(len(pv.columns) * 0.15)))]
+        if pv.empty:
+            continue
+        norm = pv.copy()
+        for c in norm.columns:
+            first_valid = norm[c].dropna()
+            if first_valid.empty or first_valid.iloc[0] == 0:
+                norm[c] = np.nan
+            else:
+                norm[c] = norm[c] / first_valid.iloc[0] * 1200.0
+        ser = norm.mean(axis=1, skipna=True).rename(field)
+        frames.append(ser)
+
+    if len(frames) < 4:
+        return pd.DataFrame()
+    out = pd.concat(frames, axis=1).reset_index()
+    vol = x.groupby("date")["volume"].sum().rename("volume").reset_index()
+    out = out.merge(vol, on="date", how="left")
+    # Ensure OHLC consistency for plotting/relative-strength calculations.
+    hi = out[["open", "high", "low", "close"]].max(axis=1)
+    lo = out[["open", "high", "low", "close"]].min(axis=1)
+    out["high"] = hi
+    out["low"] = lo
+    return preprocess_index(out[["date", "open", "high", "low", "close", "volume"]])
+
 def try_auto_list_symbols(limit: int = 120) -> List[str]:
     """Best-effort listing. If the installed vnstock version changes API, fallback is used."""
     candidates = []
@@ -1002,8 +1049,8 @@ def make_candlestick_chart(tg: pd.DataFrame, detail: Dict) -> go.Figure:
 # -----------------------------
 def main():
     st.set_page_config(page_title="Smart Money Red Base Scanner", layout="wide")
-    st.title("Smart Money Red Base Scanner – Auto Data MVP V0.5")
-    st.caption("Tự tải dữ liệu thị trường, quét dấu hiệu tay to gom hàng, ưu tiên mua đỏ trong nền, không mua xanh/đu break.")
+    st.title("Smart Money Red Base Scanner – Auto Data MVP V0.7")
+    st.caption("Tự tải dữ liệu thị trường, quét dấu hiệu tay to gom hàng, ưu tiên mua đỏ trong nền, không mua xanh/đu break. Nếu VNINDEX không tải được, app tự tạo chỉ số thị trường thay thế từ rổ mã đã tải.")
 
     with st.expander("Triết lý hệ thống", expanded=False):
         st.markdown(
@@ -1096,11 +1143,10 @@ def main():
             end_str = pd.Timestamp(end_dt + timedelta(days=1)).strftime("%Y-%m-%d")  # include end date for Yahoo-style APIs
 
             with st.spinner(f"Đang tự tải dữ liệu {len(tickers)} mã + VNINDEX từ {data_mode}..."):
+                # 1) Try VNINDEX, but do not stop if provider fails. Cloud providers often block or rename index symbols.
                 idx_df, idx_err = fetch_index_auto(start_str, end_str, provider, vnstock_source)
-                if idx_df.empty:
-                    st.error(f"Không tự tải được VNINDEX. Lỗi: {idx_err}")
-                    st.stop()
 
+                # 2) Load equities. The scanner can still run if we later build a synthetic market proxy.
                 parts = []
                 failed = []
                 progress = st.progress(0, text="Đang tải mã...")
@@ -1121,10 +1167,22 @@ def main():
                     st.stop()
 
                 prices = preprocess_prices(pd.concat(parts, ignore_index=True))
-                vnindex = idx_df
+
+                # 3) If VNINDEX failed, build a proxy index from the successfully downloaded universe.
+                if idx_df.empty:
+                    vnindex = build_synthetic_market_index(prices)
+                    if vnindex.empty:
+                        st.error(f"Không tự tải được VNINDEX và cũng không tạo được chỉ số thay thế. Lỗi VNINDEX: {idx_err}")
+                        st.stop()
+                    st.warning("VNINDEX không tải được từ nguồn online. App đã tự tạo 'Market Proxy Index' từ rổ mã tải thành công để vẫn quét được sức mạnh tương đối.")
+                    with st.expander("Xem lỗi VNINDEX gốc"):
+                        st.write(idx_err)
+                else:
+                    vnindex = idx_df
+
                 fundamentals = build_neutral_fundamentals(sorted(prices["ticker"].unique()))
 
-                st.success(f"Đã tự tải {prices['ticker'].nunique()} mã, {len(prices):,} dòng giá và VNINDEX. Không cần upload file.")
+                st.success(f"Đã tự tải {prices['ticker'].nunique()} mã, {len(prices):,} dòng giá. Không cần upload file.")
                 if failed:
                     st.warning(f"Có {len(failed)} mã không tải được. App bỏ qua các mã đó và vẫn quét phần còn lại.")
                     with st.expander("Xem lỗi các mã không tải được"):
@@ -1240,3 +1298,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
