@@ -13,7 +13,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Market Winner Scanner V2.0 Late Cycle Guard", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(page_title="Gold Pipeline Scanner V2.1", layout="wide", initial_sidebar_state="expanded")
 
 # ============================================================
 # UNIVERSE
@@ -62,6 +62,10 @@ MACRO = {
     "WTI":"CL=F", "Brent":"BZ=F", "DXY":"DX-Y.NYB", "US10Y":"^TNX", "Gold":"GC=F",
 }
 
+# Các mã đã/đang có rủi ro lịch sử, thanh khoản méo hoặc bị hạn chế giao dịch.
+# Không loại cứng toàn bộ, nhưng đưa vào cờ chất lượng dữ liệu để tránh app chọn nhầm khi nguồn Yahoo vẫn còn giá cũ.
+STRUCTURAL_RISK_TICKERS = set("FLC ROS DLG LDG HQC AMD HAI KLF ART TTF JVC AMV".split())
+
 # ============================================================
 # BASIC HELPERS
 # ============================================================
@@ -85,6 +89,190 @@ def parse_tickers(text: str) -> List[str]:
         if t and t not in out:
             out.append(t)
     return out
+
+
+
+
+def sector_leader_universe(tickers: List[str], leaders_per_sector: int = 7, include_other: bool = False) -> List[str]:
+    """Lấy 5–7 mã đại diện/đầu ngành cho MỖI ngành.
+
+    Mục tiêu V2.3: không ép soi BID/GVR cố định, mà tạo rổ bao phủ đều toàn thị trường.
+    Thứ tự trong BROAD_180 được xem là thứ tự ưu tiên tương đối: mã đầu ngành/thanh khoản/đại diện ngành đứng trước.
+    """
+    leaders_per_sector = int(max(1, min(10, leaders_per_sector)))
+    clean = []
+    for t in tickers:
+        t = norm_ticker(t)
+        if t and t not in clean:
+            clean.append(t)
+    by_sector: Dict[str, List[str]] = {}
+    for t in clean:
+        sec = SECTOR_MAP.get(t, "Khác")
+        if sec == "Khác" and not include_other:
+            continue
+        arr = by_sector.setdefault(sec, [])
+        if len(arr) < leaders_per_sector:
+            arr.append(t)
+    # Trả theo round-robin để phần đầu danh sách đã cân bằng ngành, không bị ngân hàng/chứng khoán lấn hết.
+    selected = []
+    sectors = sorted(by_sector.keys(), key=lambda k: (k == "Khác", k))
+    for i in range(leaders_per_sector):
+        for sec in sectors:
+            arr = by_sector.get(sec, [])
+            if i < len(arr) and arr[i] not in selected:
+                selected.append(arr[i])
+    return selected
+
+
+def sector_leader_summary(tickers: List[str], leaders_per_sector: int = 7) -> pd.DataFrame:
+    rows = []
+    leaders = sector_leader_universe(tickers, leaders_per_sector, include_other=False)
+    for sec in sorted(set(SECTOR_MAP.get(t, "Khác") for t in leaders)):
+        if sec == "Khác":
+            continue
+        arr = [t for t in leaders if SECTOR_MAP.get(t, "Khác") == sec]
+        rows.append({"sector": sec, "so_ma_dau_nganh": len(arr), "tickers": ", ".join(arr)})
+    return pd.DataFrame(rows)
+
+
+def ensure_all_sector_leaders(tickers: List[str], leaders_per_sector: int, extra: List[str] | None = None) -> List[str]:
+    """Ghép rổ người dùng với 5–7 mã đầu ngành, tránh bỏ sót ngành khi giới hạn quét."""
+    leaders = sector_leader_universe(parse_tickers(BROAD_180), leaders_per_sector, include_other=False)
+    out = []
+    for t in (extra or []) + leaders + tickers:
+        t = norm_ticker(t)
+        if t and t not in out:
+            out.append(t)
+    return out
+
+def sector_balanced_select(tickers: List[str], max_n: int, must_watch: List[str] | None = None) -> List[str]:
+    """Chọn rổ quét không lấy đơn giản N mã đầu tiên.
+
+    Lỗi V2.1: nếu BROAD_180 bị giới hạn 80-100 mã, các mã nằm phía sau danh sách
+    như GVR có thể không hề được tải, nên app không thể phát hiện.
+    V2.3 chọn theo kiểu cân bằng ngành + ưu tiên 5–7 mã đầu ngành mỗi ngành; mã người dùng nhập thêm chỉ là phụ.
+    """
+    must_watch = [norm_ticker(x) for x in (must_watch or []) if norm_ticker(x)]
+    clean = []
+    for t in tickers:
+        t = norm_ticker(t)
+        if t and t not in clean:
+            clean.append(t)
+    selected = []
+    for t in must_watch:
+        if t in clean and t not in selected:
+            selected.append(t)
+    by_sector: Dict[str, List[str]] = {}
+    for t in clean:
+        by_sector.setdefault(SECTOR_MAP.get(t, "Khác"), []).append(t)
+    sectors = sorted(by_sector.keys(), key=lambda k: (k == "Khác", k))
+    # Round-robin theo ngành để tránh bị thiên lệch vì thứ tự danh sách.
+    idx = 0
+    while len(selected) < max_n:
+        added = False
+        for sec in sectors:
+            arr = by_sector.get(sec, [])
+            if idx < len(arr):
+                t = arr[idx]
+                if t not in selected:
+                    selected.append(t)
+                    added = True
+                    if len(selected) >= max_n:
+                        break
+        if not added:
+            break
+        idx += 1
+    # Nếu vẫn thiếu, bổ sung theo thứ tự gốc.
+    for t in clean:
+        if len(selected) >= max_n:
+            break
+        if t not in selected:
+            selected.append(t)
+    return selected[:max_n]
+
+
+def pct(a, b):
+    return (a / b - 1) * 100 if b not in [0, None] and np.isfinite(b) else np.nan
+
+
+def prelaunch_metrics(d: pd.DataFrame, market: pd.DataFrame | None = None, cfg: Dict | None = None) -> Dict[str, object]:
+    """Tín hiệu T-1: phát hiện trước khi giá nổ.
+
+    Mục tiêu là bắt các mã như BID/GVR ở phiên trước: chưa nhất thiết nằm vùng mua đỏ,
+    nhưng có dòng tiền len vào, nền siết, sức mạnh tương đối, áp sát vùng kích hoạt.
+    """
+    cfg = cfg or {}
+    if d is None or len(d) < 45:
+        return {"prelaunch_score":0.0, "prelaunch_label":"NO_DATA", "prelaunch_reason":"Không đủ dữ liệu T-1", "prelaunch_trigger":""}
+    x = enrich(d.copy()).sort_values("date")
+    last = x.iloc[-1]
+    close = float(last.close)
+    val20 = float(last.val20) if np.isfinite(last.val20) and last.val20 > 0 else float(x.value.tail(20).mean())
+    val3 = float(x.value.tail(3).mean())
+    val5 = float(x.value.tail(5).mean())
+    val60 = float(x.value.tail(60).mean()) if len(x) >= 60 else val20
+    vr3 = val3 / val20 if val20 > 0 else 1.0
+    vr5 = val5 / val20 if val20 > 0 else 1.0
+    vr20_60 = val20 / val60 if val60 > 0 else 1.0
+    cmf = float(last.cmf20) if np.isfinite(last.cmf20) else 0.0
+    obv5 = 0.0
+    if len(x) >= 8 and abs(float(x.obv.iloc[-6])) > 0:
+        obv5 = (float(x.obv.iloc[-1]) - float(x.obv.iloc[-6])) / max(1, abs(float(x.obv.iloc[-6])))
+    recent20 = x.tail(20)
+    recent10 = x.tail(10)
+    support = float(recent20.low.quantile(0.20))
+    resist = float(recent20.high.quantile(0.90))
+    range20 = pct(resist, support) if support > 0 else 999
+    range10 = pct(float(recent10.high.max()), float(recent10.low.min())) if len(recent10) else 999
+    near_break = close >= resist * 0.965 and close <= resist * 1.025
+    above_support = close >= support * 1.015
+    not_extended_5 = abs(float(x.close.iloc[-1] / x.close.iloc[-6] - 1) * 100) <= float(cfg.get("t1_max_ret5_abs", 7.5)) if len(x) >= 6 else True
+    ret5 = float(x.close.iloc[-1] / x.close.iloc[-6] - 1) if len(x) >= 6 else 0.0
+    ret20 = float(x.close.iloc[-1] / x.close.iloc[-21] - 1) if len(x) >= 21 else 0.0
+    vol_dry_pullback = bool(ret5 <= 0.025 and float(x.volume.tail(3).mean()) <= float(x.volume.tail(20).mean()) * 1.25 and close >= support * 1.02)
+    rs5 = 0.0; rs20 = 0.0
+    if market is not None and len(market):
+        m = pd.merge(x[["date","close"]], market[["date","close"]].rename(columns={"close":"mclose"}), on="date", how="inner")
+        if len(m) >= 22:
+            rs5 = (m.close.iloc[-1]/m.close.iloc[-6]-1) - (m.mclose.iloc[-1]/m.mclose.iloc[-6]-1) if len(m) >= 6 else 0
+            rs20 = (m.close.iloc[-1]/m.close.iloc[-21]-1) - (m.mclose.iloc[-1]/m.mclose.iloc[-21]-1)
+    score = 0.0
+    score += 18 if vr3 >= 1.25 else 13 if vr3 >= 1.10 else 6 if vr3 >= 0.95 else 0
+    score += 14 if vr5 >= 1.18 else 10 if vr5 >= 1.05 else 4 if vr5 >= 0.92 else 0
+    score += 10 if vr20_60 >= 1.10 else 6 if vr20_60 >= 1.0 else 0
+    score += 12 if cmf >= 0.10 else 8 if cmf >= 0.03 else 0
+    score += 10 if obv5 > 0 else 0
+    score += 12 if range20 <= 10 else 8 if range20 <= 14 else 4 if range20 <= 18 else 0
+    score += 10 if range10 <= 7 else 6 if range10 <= 10 else 0
+    score += 10 if near_break else 6 if above_support else 0
+    score += 10 if rs20 > 0 else 4 if rs5 > 0 else 0
+    score += 8 if vol_dry_pullback else 0
+    score += 6 if not_extended_5 else -8
+    score = clamp(score, 0, 100)
+    if score >= 78:
+        label = "T-1 STRONG"
+    elif score >= 65:
+        label = "T-1 WATCH"
+    elif score >= 52:
+        label = "EARLY RADAR"
+    else:
+        label = "NO EARLY"
+    reasons = []
+    if vr3 >= 1.10 or vr5 >= 1.05: reasons.append(f"GTGD 3/5 phiên tăng ({vr3:.2f}/{vr5:.2f}x)")
+    if cmf >= 0.03: reasons.append(f"CMF dương {cmf:.2f}")
+    if range20 <= 14: reasons.append(f"nền 20 phiên siết {range20:.1f}%")
+    if near_break: reasons.append("áp sát vùng kích hoạt")
+    if rs20 > 0: reasons.append("mạnh hơn thị trường")
+    if vol_dry_pullback: reasons.append("pullback volume không xấu")
+    trigger = f"Theo dõi T+1: ưu tiên mua đỏ/rung lắc quanh hỗ trợ {fmt(support)}–{fmt(min(close, resist))}; không đu nếu gap xanh mạnh vượt {fmt(resist)}"
+    return {
+        "prelaunch_score": round(score,1), "prelaunch_label": label,
+        "prelaunch_reason": " | ".join(reasons) if reasons else "Chưa đủ dấu vết T-1",
+        "prelaunch_trigger": trigger, "t1_support": support, "t1_resistance": resist,
+        "t1_range20_pct": round(range20,2) if np.isfinite(range20) else np.nan,
+        "t1_value_ratio_3_20": round(vr3,2), "t1_value_ratio_5_20": round(vr5,2),
+        "t1_cmf20": round(cmf,3), "t1_rs20_pct": round(rs20*100,2), "t1_ret5_pct": round(ret5*100,2), "t1_ret20_pct": round(ret20*100,2)
+    }
 
 
 def unix(d: date) -> int:
@@ -296,8 +484,8 @@ def fetch_one_ticker(ticker: str, days: int, end: date) -> Tuple[str, pd.DataFra
     return norm_ticker(ticker), pd.DataFrame(), " | ".join(errors[:2])
 
 
-def fetch_universe_parallel(tickers: List[str], days: int, end: date, max_n: int, workers: int = 8) -> Tuple[pd.DataFrame, List[str]]:
-    chosen = [norm_ticker(t) for t in tickers if norm_ticker(t)][:max_n]
+def fetch_universe_parallel(tickers: List[str], days: int, end: date, max_n: int, workers: int = 8, must_watch: List[str] | None = None) -> Tuple[pd.DataFrame, List[str]]:
+    chosen = sector_balanced_select(tickers, max_n, must_watch=must_watch)
     rows, errs = [], []
     prog = st.progress(0, text=f"Đang tải {len(chosen)} mã...")
     done = 0
@@ -487,6 +675,22 @@ def choose_vn_base(d: pd.DataFrame, cfg: Dict) -> Tuple[pd.DataFrame, float, flo
 def analyze_one(t, g, market, cfg):
     d = enrich(g)
     last = d.iloc[-1]
+    last_data_date = pd.to_datetime(d.date.iloc[-1]).date()
+    stale_days = max(0, (date.today() - last_data_date).days)
+    data_quality_score = 100.0
+    if len(d) < 120:
+        data_quality_score -= 12
+    if len(d) < 80:
+        data_quality_score -= 18
+    # Dữ liệu sau phiên hoặc cuối tuần có thể trễ 1-3 ngày, không phạt mạnh.
+    if stale_days > 5:
+        data_quality_score -= min(35, (stale_days - 5) * 4)
+    if float(d.volume.tail(20).median()) <= 0:
+        data_quality_score -= 30
+    if norm_ticker(t) in STRUCTURAL_RISK_TICKERS:
+        data_quality_score -= 20
+    data_quality_score = clamp(data_quality_score, 0, 100)
+    data_quality_state = "Tốt" if data_quality_score >= 80 else "Chấp nhận" if data_quality_score >= 60 else "Yếu/cần kiểm tra"
     raw_base, raw_base_low, raw_base_high, raw_base_range_pct, raw_base_method = choose_vn_base(d, cfg)
     close = float(last.close)
     atr = float(last.atr14) if np.isfinite(last.atr14) and last.atr14 > 0 else max(close * 0.018, (raw_base_high-raw_base_low)/8)
@@ -622,8 +826,15 @@ def analyze_one(t, g, market, cfg):
             rs20 = (m.close.iloc[-1]/m.close.iloc[-21]-1) - (m.mclose.iloc[-1]/m.mclose.iloc[-21]-1)
             alpha = clamp(50 + 300 * rs20, 0, 100)
 
+    # T-1/Pre-launch: tính trên dữ liệu trước phiên cuối để xem app có thể cảnh báo trước khi giá nổ hay không.
+    prev_metrics = prelaunch_metrics(d.iloc[:-1].copy(), market=market, cfg=cfg) if len(d) >= 70 else {"prelaunch_score":0.0, "prelaunch_label":"NO_DATA", "prelaunch_reason":"Không đủ dữ liệu T-1", "prelaunch_trigger":""}
+    now_metrics = prelaunch_metrics(d.copy(), market=market, cfg=cfg) if len(d) >= 70 else {"prelaunch_score":0.0, "prelaunch_label":"NO_DATA", "prelaunch_reason":"Không đủ dữ liệu hiện tại", "prelaunch_trigger":""}
+
     val20 = float(last.val20) if np.isfinite(last.val20) else 0
     val60 = float(last.val60) if np.isfinite(last.val60) else 0
+    if val20 < cfg["min_val"] * 1e9:
+        data_quality_score = clamp(data_quality_score - 25, 0, 100)
+        data_quality_state = "Yếu/cần kiểm tra" if data_quality_score < 60 else data_quality_state
     v5 = d.value.tail(5).mean()
     vr5 = v5/val20 if val20 > 0 else 1
     vr20 = val20/val60 if val60 > 0 else 1
@@ -764,12 +975,32 @@ def analyze_one(t, g, market, cfg):
     if not zone_valid: why.append("Loại vùng mua phi thực tế")
     if late_cycle_warning: why.append(late_cycle_state)
     if dist: why.append("Cảnh báo phân phối")
+    # Nếu chưa ở điểm mua đỏ nhưng T-1 mạnh, đưa vào radar để không bỏ lỡ BID/GVR kiểu tăng sau phiên tích lũy.
+    pre_score = float(prev_metrics.get("prelaunch_score", 0) or 0)
+    pre_label = str(prev_metrics.get("prelaunch_label", ""))
+    if pre_score >= float(cfg.get("t1_watch_threshold", 65)) and not dist and not late_cycle_hard_ban:
+        why.append(f"T-1 alert {pre_label} {pre_score:.1f}")
+        if action in ["THEO DÕI - CHỜ RUNG LẮC", "KHÔNG ĐU XANH - CHỜ VỀ VÙNG GẦN", "VÙNG C - THẬN TRỌNG"]:
+            action = "T-1 WATCH - CANH ĐỎ PHIÊN KẾ TIẾP"
+        conc = max(conc, min(82, pre_score * 0.95))
+        victory = max(victory, min(84, pre_score * 0.98))
+        if clabel == "EARLY" and pre_score >= 72 and zone_valid:
+            clabel = "WATCH"
+        if "CHƯA ĐỦ" in vlabel and pre_score >= 65:
+            vlabel = "THEO DÕI T-1"
 
     return {
         "ticker":t, "sector":g.sector.iloc[-1] if "sector" in g else SECTOR_MAP.get(t,"Khác"), "close":close,
+        "data_quality_score":round(data_quality_score,1), "data_quality_state":data_quality_state, "last_data_date":str(last_data_date), "stale_days":stale_days,
+        "val20_billion":round(val20/1e9,2), "vol_ratio_last":round(vol_ratio,2),
         "phase":phase, "signal":sig, "action_decision":action, "Điểm tổng":round(total,1),
         "victory_score":round(victory,1), "victory_label":vlabel, "concentration_score":round(conc,1), "concentration_label":clabel,
         "money_flow_score":round(mf,1), "money_flow_state":mf_state, "value_ratio_5_20":round(vr5,2), "value_ratio_20_60":round(vr20,2),
+        "prelaunch_score_t1":prev_metrics.get("prelaunch_score", 0), "prelaunch_label_t1":prev_metrics.get("prelaunch_label", ""),
+        "prelaunch_reason_t1":prev_metrics.get("prelaunch_reason", ""), "prelaunch_trigger_t1":prev_metrics.get("prelaunch_trigger", ""),
+        "prelaunch_score_now":now_metrics.get("prelaunch_score", 0), "prelaunch_label_now":now_metrics.get("prelaunch_label", ""),
+        "t1_value_ratio_3_20":prev_metrics.get("t1_value_ratio_3_20", np.nan), "t1_range20_pct":prev_metrics.get("t1_range20_pct", np.nan),
+        "t1_cmf20":prev_metrics.get("t1_cmf20", np.nan), "t1_rs20_pct":prev_metrics.get("t1_rs20_pct", np.nan),
         "up_value_ratio_pct":round(upv*100,1), "cmf20":round(cmf,3), "rs20_vs_market_pct":round(rs20*100,2),
         "zone_model":zone_model, "zone_valid":zone_valid, "distance_to_buy_zone_pct":round(distance_to_zone_pct,2) if np.isfinite(distance_to_zone_pct) else np.nan,
         "base_zone":frange(base_low,base_high), "old_base_zone":frange(raw_base_low,raw_base_high), "base_range_pct":round(base_range_pct,2), "atr14_pct":round(atr_pct,2) if np.isfinite(atr_pct) else np.nan, "base_method":base_method,
@@ -815,18 +1046,149 @@ def sector_map_df(res):
     return g.sort_values(["diem_dong_tien_tb","diem_co_dac_tb"], ascending=False)
 
 
+def add_gold_pipeline(res: pd.DataFrame, macro: Dict) -> pd.DataFrame:
+    """Bộ lọc đãi cát tìm vàng V2.1.
+
+    Nguyên tắc: không chọn mã chỉ vì điểm tổng cao. Một mã muốn lọt nhóm vàng phải đi qua nhiều cổng:
+    dữ liệu sạch, thanh khoản đủ, không cuối sóng, không phân phối, có dòng tiền, ngành không quá yếu,
+    vùng mua còn thực tế, R/R chấp nhận được và vĩ mô không đóng cửa mua mới.
+    """
+    if res is None or res.empty:
+        return res
+    r = res.copy()
+    sec = sector_map_df(r)
+    if not sec.empty:
+        sec2 = sec[["sector", "diem_dong_tien_tb", "diem_co_dac_tb", "sector_state"]].rename(columns={
+            "diem_dong_tien_tb":"sector_money_flow_score",
+            "diem_co_dac_tb":"sector_concentration_score",
+        })
+        r = r.merge(sec2, on="sector", how="left")
+    else:
+        r["sector_money_flow_score"] = 0
+        r["sector_concentration_score"] = 0
+        r["sector_state"] = "Không rõ"
+    for c in ["sector_money_flow_score", "sector_concentration_score"]:
+        r[c] = pd.to_numeric(r.get(c, 0), errors="coerce").fillna(0)
+
+    macro_mode = macro.get("risk_mode", "Normal")
+    macro_score = float(macro.get("macro_score", 60) or 60)
+    gold_scores, gold_labels, gold_gates, reject_reasons, entry_timing, priority = [], [], [], [], [], []
+
+    for _, x in r.iterrows():
+        hard, soft = [], []
+        if macro_mode == "Off": hard.append("Vĩ mô đóng cửa mua mới")
+        elif macro_mode == "Small": soft.append("Vĩ mô chỉ cho thăm dò nhỏ")
+        if float(x.get("data_quality_score", 100)) < 55: hard.append("Dữ liệu/ thanh khoản yếu")
+        if float(x.get("val20_billion", 0)) < 5: hard.append("GTGD bình quân thấp")
+        if bool(x.get("late_cycle_hard_ban", False)): hard.append("Cuối sóng/quá nóng")
+        if bool(x.get("distribution_warning", False)): hard.append("Cảnh báo phân phối")
+        pre_score = float(x.get("prelaunch_score_t1", 0) or 0)
+        has_t1_watch = pre_score >= 65
+        if not bool(x.get("zone_valid", True)) and not has_t1_watch:
+            hard.append("Không có vùng mua thực tế")
+        elif not bool(x.get("zone_valid", True)) and has_t1_watch:
+            soft.append("T-1 tốt nhưng chưa có vùng mua đỏ thực tế")
+        mf = float(x.get("money_flow_score", 0))
+        if mf < 8: hard.append("Dòng tiền yếu")
+        elif mf < 13: soft.append("Dòng tiền chưa đủ mạnh")
+        rr = pd.to_numeric(x.get("rr_to_base_high", np.nan), errors="coerce")
+        risk_buy = pd.to_numeric(x.get("risk_pct_from_buy_zone", np.nan), errors="coerce")
+        if not np.isfinite(rr) or rr < 0.8: hard.append("R/R kém")
+        elif rr < 1.15: soft.append("R/R chỉ vừa đủ")
+        if np.isfinite(risk_buy) and risk_buy > 7.5: soft.append("Rủi ro từ vùng mua hơi rộng")
+        if float(x.get("sector_money_flow_score", 0)) < 9: soft.append("Ngành chưa có dòng tiền rõ")
+        if "KHÔNG ĐU XANH" in str(x.get("action_decision", "")) or "CHỜ" in str(x.get("action_decision", "")):
+            soft.append("Chưa ở điểm mua đỏ")
+
+        rr_part = 0 if not np.isfinite(rr) else min(18, max(0, rr) * 6)
+        risk_penalty = 0 if not np.isfinite(risk_buy) else max(0, risk_buy - 5) * 2.2
+        late_penalty = 12 if bool(x.get("late_cycle_warning", False)) else 0
+        macro_part = min(15, max(0, macro_score) * 0.15)
+        pre_score = float(x.get("prelaunch_score_t1", 0) or 0)
+        pre_part = min(18, pre_score * 0.20)
+        score = (
+            float(x.get("victory_score", 0)) * 0.23
+            + float(x.get("concentration_score", 0)) * 0.22
+            + mf * 1.45
+            + float(x.get("sector_money_flow_score", 0)) * 1.05
+            + float(x.get("data_quality_score", 70)) * 0.08
+            + rr_part
+            + macro_part
+            + pre_part
+            - risk_penalty
+            - late_penalty
+            - len(hard) * 18
+            - len(soft) * 3.5
+        )
+        score = clamp(score, 0, 100)
+
+        if hard:
+            label = "REJECT"
+            gate = "LOẠI"
+        elif score >= 76 and mf >= 15 and float(x.get("sector_money_flow_score",0)) >= 10:
+            label = "GOLD_CORE"
+            gate = "VÀNG - ƯU TIÊN THEO SÁT"
+        elif score >= 62 or (has_t1_watch and mf >= 10):
+            label = "GOLD_WATCH"
+            gate = "VÀNG THEO DÕI/T-1 - CHỜ ĐIỂM MUA ĐỎ"
+        else:
+            label = "SILVER_EARLY"
+            gate = "ỨNG VIÊN SỚM - CHƯA CÔ ĐẶC VỐN"
+
+        act = str(x.get("action_decision", ""))
+        if "VÙNG A" in act:
+            timing = "Đang ở vùng A - có thể canh đỏ"
+            pr = 1
+        elif "VÙNG B" in act:
+            timing = "Đang ở vùng B - thăm dò nhỏ"
+            pr = 2
+        elif "VÙNG C" in act:
+            timing = "Vùng C - rủi ro cao hơn"
+            pr = 3
+        elif has_t1_watch:
+            timing = "T-1 watch: canh đỏ/rung lắc phiên kế tiếp"
+            pr = 3
+        elif label.startswith("GOLD"):
+            timing = "Chờ rung lắc về vùng A/B"
+            pr = 4
+        else:
+            timing = "Chưa có điểm mua"
+            pr = 9
+
+        gold_scores.append(round(score, 1))
+        gold_labels.append(label)
+        gold_gates.append(gate)
+        reject_reasons.append(" | ".join(hard + soft) if (hard or soft) else "Đạt các cổng chính")
+        entry_timing.append(timing)
+        priority.append(pr)
+
+    r["gold_score"] = gold_scores
+    r["gold_label"] = gold_labels
+    r["gold_gate"] = gold_gates
+    r["reject_reason"] = reject_reasons
+    r["entry_timing"] = entry_timing
+    r["buy_priority_rank"] = priority
+    return r
+
+
 def focus_df(res, macro, n):
     r = res.copy(); mode = macro.get("risk_mode", "Normal")
     if mode == "Off":
         r["action_decision"] = "CHỜ THỊ TRƯỜNG - VĨ MÔ XẤU"; r["concentration_score"] *= .72
     elif mode == "Small":
         r.loc[r.action_decision.str.contains("CÓ THỂ|CHỈ", regex=True), "action_decision"] = "CHỈ THĂM DÒ NHỎ - CHỜ THIÊN THỜI"; r["concentration_score"] *= .86
+    if "gold_label" in r.columns:
+        c = r[r["gold_label"].isin(["GOLD_CORE", "GOLD_WATCH", "SILVER_EARLY"])].sort_values(
+            ["gold_score", "buy_priority_rank", "victory_score", "money_flow_score"],
+            ascending=[False, True, False, False]
+        )
+        cols = ["ticker","sector","gold_label","gold_score","gold_gate","entry_timing","prelaunch_label_t1","prelaunch_score_t1","prelaunch_reason_t1","reject_reason","sector_state","sector_money_flow_score","victory_score","money_flow_score","money_flow_state","action_decision","phase","close","red_buy_zone","stop_loss","rr_to_base_high","why_focus"]
+        return c.head(n)[[x for x in cols if x in c.columns]]
     if "late_cycle_hard_ban" in r.columns:
         r = r[~r["late_cycle_hard_ban"]]
     c = r[~r.distribution_warning].sort_values(["victory_score","concentration_score","money_flow_score","rr_to_base_high"], ascending=False)
     cols = ["ticker","sector","concentration_label","concentration_score","victory_score","victory_label","money_flow_score","money_flow_state","action_decision","phase","close","red_buy_zone","stop_loss","rr_to_base_high","why_focus"]
     return c.head(n)[cols]
-
 
 def chart(g,row):
     d = g.tail(110)
@@ -839,10 +1201,10 @@ def chart(g,row):
 # ============================================================
 # UI
 # ============================================================
-st.title("Smart Money Red Base Scanner – Late Cycle Guard MVP V2.0")
+st.title("Smart Money Red Base Scanner – Sector Leaders Gold MVP V2.3")
 st.caption("App sống theo thị trường: tự làm mới dữ liệu, theo dõi vĩ mô toàn cầu, tin tức cuối tuần và chỉ mở tín hiệu mua khi thiên thời không xấu.")
 with st.expander("Triết lý hệ thống"):
-    st.write("Không mua xanh/đu break. Ưu tiên cổ phiếu có dòng tiền, ngành có tiền, vĩ mô không xấu, giá ở vùng đỏ trong nền. Bản V2.0 sửa điểm chí mạng: không được nhầm dòng tiền vào ở cuối sóng với cơ hội mua. Cổ phiếu đã tăng quá xa/nhân nhiều lần trong 6–12 tháng sẽ bị chặn mua mới, dù dòng tiền còn mạnh. App chỉ theo dõi lại khi tạo nền mới thực sự gần giá hiện tại.")
+    st.write("Không mua xanh/đu break. Ưu tiên cổ phiếu có dòng tiền, ngành có tiền, vĩ mô không xấu, giá ở vùng đỏ trong nền. Bản V2.2 thêm Gold Pipeline: đãi cát qua nhiều cổng dữ liệu, thanh khoản, dòng tiền ngành, dòng tiền cổ phiếu, vị trí mua đỏ, R/R, vĩ mô và bộ lọc cuối sóng. Chỉ 2–3 mã qua nhiều cổng mới được đưa vào nhóm vàng.")
 
 with st.sidebar:
     st.header("0) Live Pulse")
@@ -859,14 +1221,20 @@ with st.sidebar:
 
     st.header("1) Dữ liệu & độ bao phủ")
     data_mode = st.radio("Nguồn dữ liệu", ["Tự động Yahoo Direct", "Upload thủ công", "Demo"], index=0)
-    universe_preset = st.selectbox("Rổ mã", ["Rộng 150+ mã thanh khoản/đại diện ngành", "Core 69 mã", "Tùy chỉnh"], index=0)
-    if universe_preset == "Rộng 150+ mã thanh khoản/đại diện ngành":
+    leaders_per_sector_ui = st.slider("Số mã đầu ngành mỗi ngành", 5, 7, 7, step=1, help="V2.3: lấy 5–7 mã đầu ngành/tăng thanh khoản của từng nhóm ngành để đãi cát rộng mà vẫn không quá nặng.")
+    universe_preset = st.selectbox("Rổ mã", ["5–7 mã đầu ngành mỗi ngành - khuyên dùng", "Rộng 150+ mã thanh khoản/đại diện ngành", "Core 69 mã", "Tùy chỉnh"], index=0)
+    if universe_preset == "5–7 mã đầu ngành mỗi ngành - khuyên dùng":
+        default_list = sector_leader_universe(parse_tickers(BROAD_180), leaders_per_sector_ui, include_other=False)
+        default_text = ", ".join(default_list)
+    elif universe_preset == "Rộng 150+ mã thanh khoản/đại diện ngành":
         default_text = BROAD_180
     elif universe_preset == "Core 69 mã":
         default_text = CORE_69
     else:
         default_text = CORE_69
     ticker_text = st.text_area("Danh sách mã", default_text, height=150)
+    force_sector_leaders = st.checkbox("Luôn ép đủ 5–7 mã đầu ngành mỗi ngành", value=True, help="Bật mục này để dù danh sách tùy chỉnh hoặc giới hạn quét thấp, app vẫn ưu tiên rổ đầu ngành toàn thị trường.")
+    must_watch_text = st.text_input("Mã muốn soi thêm, không bắt buộc", value="", help="Không để mặc định BID/GVR nữa. Chỉ nhập khi anh muốn soi thêm một vài mã riêng.")
     scan_mode = st.radio("Chế độ quét", ["Đãi cát 2 vòng - khuyên dùng", "Một vòng đầy đủ", "Test nhanh"], index=0)
     end_date = st.date_input("Ngày kết thúc", value=date.today())
     if scan_mode == "Đãi cát 2 vòng - khuyên dùng":
@@ -895,6 +1263,10 @@ with st.sidebar:
     vn_no_chase_pct = st.slider("Không mua nếu cách hỗ trợ quá (%)", 4.0, 12.0, 6.0, step=0.5)
     max_action_pullback_pct = st.slider("Vùng mua thực tế tối đa cách giá hiện tại (%)", 3.0, 12.0, 7.0, step=0.5)
     st.caption("V1.9: Nếu vùng mua tính ra thấp hơn ngưỡng này, app sẽ coi là không thực tế và chuyển sang CHỜ NỀN MỚI/PULLBACK GẦN.")
+    st.header("2A) T-1 Early Alert")
+    t1_watch_threshold = st.slider("Ngưỡng cảnh báo T-1", 50, 85, 65, step=5)
+    t1_max_ret5_abs = st.slider("T-1 không đuổi nếu 5 phiên đã tăng/giảm quá (%)", 4.0, 12.0, 7.5, step=0.5)
+    st.caption("V2.2: bắt sớm mã có dòng tiền len vào + nền siết + mạnh hơn thị trường trước khi giá nổ; dùng để canh đỏ phiên kế tiếp, không mua xanh.")
     st.header("2B) Chặn cổ phiếu quá nóng/cuối sóng")
     late_hard_return_pct = st.slider("Cấm mua nếu tăng 6–12 tháng vượt (%)", 80, 500, 180, step=10)
     late_hard_runup_pct = st.slider("Cấm mua nếu tăng từ đáy 6–12 tháng vượt (%)", 120, 900, 260, step=20)
@@ -908,7 +1280,7 @@ with st.sidebar:
     up_file = None
     if data_mode == "Upload thủ công":
         up_file = st.file_uploader("Upload prices CSV/XLSX", type=["csv","xlsx","xls"])
-    st.info("Khuyên dùng: Đãi cát 2 vòng, 80–120 mã vòng 1, phân tích sâu 20–30 mã. Nếu nguồn chậm, giảm luồng còn 4–6.")
+    st.info("Khuyên dùng: rổ 5–7 mã đầu ngành mỗi ngành + đãi cát 2 vòng. Vòng 1 quét rộng 100–140 mã, vòng 2 phân tích sâu 25–40 mã. Nếu nguồn chậm, giảm luồng còn 4–6.")
 
 # Live dashboard vẫn hiển thị ngay cả khi chưa bấm quét.
 if show_live_macro:
@@ -941,11 +1313,18 @@ if show_news_pulse:
             st.success("News Shock thấp. Không thấy cụm tin xấu nổi bật trong RSS hiện tại.")
 
 if not run:
-    st.info("Bấm nút quét để bắt đầu. Bản V2.0 có Late Cycle Guard: cổ đã tăng quá xa/nhân nhiều lần sẽ bị chặn mua mới, không nhầm dòng tiền cuối sóng với cơ hội mua.")
+    st.info("Bấm nút quét để bắt đầu. Bản V2.3 quét 5–7 mã đầu ngành mỗi ngành, tạo T-1 Radar để phát hiện sớm rồi mới lọc 2–3 ứng viên vàng cuối cùng.")
     st.stop()
 
 tickers = parse_tickers(ticker_text)
-cfg = {"min_val":min_val, "base_window":base_window, "volume_spike":volume_spike, "max_base_range_pct":max_base, "vn_base_cap_pct":vn_base_cap_pct, "vn_red_zone_pct":vn_red_zone_pct, "vn_stop_pct":vn_stop_pct, "vn_no_chase_pct":vn_no_chase_pct, "max_action_pullback_pct":max_action_pullback_pct, "late_hard_return_pct":late_hard_return_pct, "late_hard_runup_pct":late_hard_runup_pct, "late_warn_return_pct":late_warn_return_pct, "late_warn_runup_pct":150.0, "late_hard_ma200_gap_pct":85.0, "late_warn_ma50_gap_pct":28.0, "late_new_base_max_pct":late_new_base_max_pct}
+extra_watch = parse_tickers(must_watch_text)
+# V2.3: không cố định BID/GVR; mặc định ép rổ 5–7 mã đầu ngành mỗi ngành để tăng độ phủ.
+if force_sector_leaders:
+    tickers = ensure_all_sector_leaders(tickers, leaders_per_sector_ui, extra=extra_watch)
+elif extra_watch:
+    tickers = extra_watch + [t for t in tickers if t not in extra_watch]
+cfg = {"min_val":min_val, "base_window":base_window, "volume_spike":volume_spike, "max_base_range_pct":max_base, "vn_base_cap_pct":vn_base_cap_pct, "vn_red_zone_pct":vn_red_zone_pct, "vn_stop_pct":vn_stop_pct, "vn_no_chase_pct":vn_no_chase_pct, "max_action_pullback_pct":max_action_pullback_pct, "t1_watch_threshold":t1_watch_threshold, "t1_max_ret5_abs":t1_max_ret5_abs, "late_hard_return_pct":late_hard_return_pct, "late_hard_runup_pct":late_hard_runup_pct, "late_warn_return_pct":late_warn_return_pct, "late_warn_runup_pct":150.0, "late_hard_ma200_gap_pct":85.0, "late_warn_ma50_gap_pct":28.0, "late_new_base_max_pct":late_new_base_max_pct}
+must_watch = extra_watch
 errors = []
 
 if data_mode == "Demo":
@@ -962,7 +1341,7 @@ elif data_mode == "Upload thủ công":
 else:
     if scan_mode == "Đãi cát 2 vòng - khuyên dùng":
         st.subheader("Vòng 1: Quét rộng nhanh")
-        quick_prices, e1 = fetch_universe_parallel(tickers, quick_days, end_date, scan_limit, workers)
+        quick_prices, e1 = fetch_universe_parallel(tickers, quick_days, end_date, scan_limit, workers, must_watch=must_watch)
         errors += e1
         if quick_prices.empty:
             st.error("Không tải được dữ liệu vòng 1. Hãy giảm số mã, giảm luồng, hoặc thử Demo/Upload.")
@@ -973,13 +1352,23 @@ else:
         quick_res, _, e_an = analyze_prices(quick_prices, quick_market, cfg); errors += e_an
         if quick_res.empty:
             st.error("Không có ứng viên sau vòng 1."); st.stop()
-        quick_res["quick_rank_score"] = quick_res["victory_score"]*.45 + quick_res["money_flow_score"]*2.0 + quick_res["concentration_score"]*.25
+        # V2.3: vòng 1 ưu tiên dòng tiền + T-1 radar + tiền ngành để phát hiện sớm trước khi giá chạy cao.
+        quick_res["quick_rank_score"] = (
+            quick_res["victory_score"]*.30
+            + quick_res["money_flow_score"]*2.4
+            + quick_res["concentration_score"]*.18
+            + quick_res.get("prelaunch_score_t1", 0)*.65
+            + quick_res.get("sector_money_flow_score", 0)*1.15
+        )
         shortlist = quick_res.sort_values("quick_rank_score", ascending=False).head(deep_top).ticker.tolist()
+        for mt in must_watch:
+            if mt in quick_res.ticker.tolist() and mt not in shortlist:
+                shortlist.append(mt)
         st.success(f"Vòng 1 tải được {quick_prices.ticker.nunique()} mã. Chọn {len(shortlist)} mã tốt nhất để phân tích sâu.")
         st.dataframe(quick_res.sort_values("quick_rank_score", ascending=False).head(20)[["ticker","sector","quick_rank_score","money_flow_score","victory_score","phase","base_range_pct","red_buy_zone"]], use_container_width=True, hide_index=True)
 
         st.subheader("Vòng 2: Phân tích sâu top ứng viên")
-        prices, e2 = fetch_universe_parallel(shortlist, deep_days, end_date, len(shortlist), workers)
+        prices, e2 = fetch_universe_parallel(shortlist, deep_days, end_date, len(shortlist), workers, must_watch=must_watch)
         errors += e2
         if prices.empty:
             st.error("Vòng 2 không tải được dữ liệu. Dùng kết quả vòng 1 tạm thời.")
@@ -989,7 +1378,7 @@ else:
             market = market_proxy(prices)
             res, details, e3 = analyze_prices(prices, market, cfg); errors += e3
     else:
-        prices, e1 = fetch_universe_parallel(tickers, deep_days, end_date, scan_limit, workers)
+        prices, e1 = fetch_universe_parallel(tickers, deep_days, end_date, scan_limit, workers, must_watch=must_watch)
         errors += e1
         if prices.empty:
             st.error("Không tải được dữ liệu cổ phiếu. Hãy giảm số mã, giảm luồng, thử Demo, hoặc upload file.")
@@ -1019,7 +1408,17 @@ try:
 except Exception as e:
     macro["errors"] = (macro.get("errors") or []) + [f"News pulse: {e}"]
 
+# V2.1: chạy Gold Pipeline sau khi có macro và kết quả phân tích từng mã.
+res = add_gold_pipeline(res, macro)
+
 st.success(f"Đã phân tích {res.ticker.nunique()} mã sau vòng lọc. Dữ liệu đang dùng: {len(prices):,} dòng giá.")
+
+with st.expander("Rổ 5–7 mã đầu ngành đang được dùng để đãi cát"):
+    try:
+        st.dataframe(sector_leader_summary(parse_tickers(BROAD_180), leaders_per_sector_ui), use_container_width=True, hide_index=True)
+        st.caption("Mục tiêu: mỗi ngành đều có đại diện đầu ngành/thanh khoản để app phát hiện tín hiệu sớm, thay vì chỉ thấy mã đã tăng cao mới biết.")
+    except Exception as e:
+        st.write(f"Không tạo được bảng đầu ngành: {e}")
 
 st.caption(f"Cập nhật lần cuối theo giờ VN: {vn_now().strftime('%H:%M:%S %d/%m/%Y')}")
 st.subheader("1) Độ bao phủ & chất lượng dữ liệu")
@@ -1031,6 +1430,26 @@ d.metric("Chế độ", scan_mode)
 if errors:
     with st.expander("Mã lỗi / bị bỏ qua để biết độ phủ thực tế"):
         st.write(errors[:200])
+
+gold_counts = res.get("gold_label", pd.Series(dtype=str)).value_counts().to_dict() if "gold_label" in res.columns else {}
+st.subheader("1B) Phễu đãi cát tìm vàng")
+g1, g2, g3, g4 = st.columns(4)
+g1.metric("GOLD CORE", int(gold_counts.get("GOLD_CORE", 0)))
+g2.metric("GOLD WATCH", int(gold_counts.get("GOLD_WATCH", 0)))
+g3.metric("SILVER/EARLY", int(gold_counts.get("SILVER_EARLY", 0)))
+g4.metric("REJECT", int(gold_counts.get("REJECT", 0)))
+with st.expander("Xem lý do bị loại nhiều nhất"):
+    if "reject_reason" in res.columns:
+        reason_series = res.loc[res["gold_label"].eq("REJECT"), "reject_reason"].astype(str)
+        if len(reason_series):
+            reason_rows = []
+            for txt in reason_series:
+                for part in txt.split(" | "):
+                    if part.strip(): reason_rows.append(part.strip())
+            if reason_rows:
+                st.dataframe(pd.Series(reason_rows).value_counts().reset_index().rename(columns={"index":"lý do", 0:"số mã"}), use_container_width=True, hide_index=True)
+        else:
+            st.write("Không có mã bị loại ở phễu vàng.")
 
 st.subheader("2) Thiên thời vĩ mô / Market Timing Gate")
 a,b,c = st.columns(3)
@@ -1055,31 +1474,51 @@ if show_news_pulse:
         if not ndf2.empty:
             st.dataframe(ndf2[["group", "shock_score", "published", "title", "link"]].head(25), use_container_width=True, hide_index=True)
 
-st.subheader("3) Bản đồ dòng tiền theo ngành")
+st.subheader("3) Cảnh báo sớm T-1 / phiên trước")
+t1_cols = ["ticker","sector","prelaunch_label_t1","prelaunch_score_t1","prelaunch_reason_t1","prelaunch_trigger_t1","money_flow_score","money_flow_state","phase","action_decision","gold_label","gold_score","close"]
+t1_view = res.sort_values(["prelaunch_score_t1","money_flow_score","victory_score"], ascending=False).head(25)
+st.dataframe(t1_view[[c for c in t1_cols if c in t1_view.columns]], use_container_width=True, hide_index=True, column_config={
+    "prelaunch_score_t1": st.column_config.ProgressColumn("Điểm T-1", min_value=0, max_value=100, format="%.1f"),
+    "money_flow_score": st.column_config.ProgressColumn("Điểm dòng tiền", min_value=0, max_value=25, format="%.1f"),
+    "gold_score": st.column_config.ProgressColumn("Điểm vàng", min_value=0, max_value=100, format="%.1f"),
+})
+with st.expander("Vì sao bản cũ có thể bỏ sót tín hiệu sớm?"):
+    st.write("1) Nếu chỉ lấy N mã đầu danh sách, nhiều ngành phía sau hoặc mã đầu ngành trong nhóm KCN/Logistics/Dược có thể không được tải. V2.3 ép đủ 5–7 mã đầu ngành mỗi ngành để tăng độ phủ.")
+    st.write("2) Không phải mã nào chuẩn bị chạy cũng đang ở vùng mua đỏ ngay. V2.3 giữ bảng T-1 Early Alert để phát hiện dòng tiền len vào, nền siết, mạnh hơn thị trường trước khi giá nổ.")
+    st.write("3) Focus 2–3 chỉ là kết quả cuối; bảng T-1 Radar và bản đồ dòng tiền ngành là lớp cảnh báo sớm để không chờ lên cao mới biết.")
+
+st.subheader("4) Bản đồ dòng tiền theo ngành")
 sec = sector_map_df(res)
 st.dataframe(sec, use_container_width=True, hide_index=True, column_config={
     "diem_dong_tien_tb": st.column_config.ProgressColumn("Điểm dòng tiền TB", min_value=0, max_value=25, format="%.1f"),
     "diem_co_dac_tb": st.column_config.ProgressColumn("Điểm cô đặc TB", min_value=0, max_value=100, format="%.1f"),
 })
 
-st.subheader("4) Focus 2–3 mã cuối cùng")
+st.subheader("4) Focus 2–3 mã vàng cuối cùng")
 focus = focus_df(res, macro, focus_n)
 st.dataframe(focus, use_container_width=True, hide_index=True, column_config={
+    "gold_score": st.column_config.ProgressColumn("Điểm vàng", min_value=0, max_value=100, format="%.1f"),
     "concentration_score": st.column_config.ProgressColumn("Điểm cô đặc", min_value=0, max_value=100, format="%.1f"),
     "victory_score": st.column_config.ProgressColumn("Điểm thắng TT", min_value=0, max_value=100, format="%.1f"),
     "money_flow_score": st.column_config.ProgressColumn("Điểm dòng tiền", min_value=0, max_value=25, format="%.1f"),
+    "sector_money_flow_score": st.column_config.ProgressColumn("Điểm tiền ngành", min_value=0, max_value=25, format="%.1f"),
 })
 
-st.subheader("5) Bảng hành động thực chiến")
-cols = ["ticker","sector","victory_score","victory_label","concentration_label","concentration_score","money_flow_score","money_flow_state","late_cycle_state","cycle_return_pct","runup_from_low_pct","ema50_gap_pct","ema200_gap_pct","new_base_mature","phase","signal","action_decision","close","zone_model","zone_valid","distance_to_buy_zone_pct","base_zone","old_base_zone","base_range_pct","atr14_pct","red_buy_zone","buy_zone_A","buy_zone_B","buy_zone_C","stop_loss","target_near","risk_pct_from_buy_zone","reward_pct_from_buy_zone","rr_to_base_high","rs20_vs_market_pct","base_method","why_focus"]
-st.dataframe(res.sort_values(["victory_score","concentration_score"], ascending=False)[cols], use_container_width=True, hide_index=True, column_config={
+st.subheader("6) Bảng hành động thực chiến")
+cols = ["ticker","sector","gold_label","gold_score","gold_gate","entry_timing","prelaunch_label_t1","prelaunch_score_t1","prelaunch_reason_t1","data_quality_score","data_quality_state","val20_billion","last_data_date","stale_days","sector_state","sector_money_flow_score","victory_score","victory_label","concentration_label","concentration_score","money_flow_score","money_flow_state","late_cycle_state","cycle_return_pct","runup_from_low_pct","ema50_gap_pct","ema200_gap_pct","new_base_mature","phase","signal","action_decision","close","zone_model","zone_valid","distance_to_buy_zone_pct","base_zone","old_base_zone","base_range_pct","atr14_pct","red_buy_zone","buy_zone_A","buy_zone_B","buy_zone_C","stop_loss","target_near","risk_pct_from_buy_zone","reward_pct_from_buy_zone","rr_to_base_high","rs20_vs_market_pct","base_method","why_focus"]
+cols = [c for c in cols if c in res.columns]
+sort_cols = [c for c in ["gold_score", "victory_score", "concentration_score"] if c in res.columns]
+st.dataframe(res.sort_values(sort_cols, ascending=False)[cols], use_container_width=True, hide_index=True, column_config={
+    "gold_score": st.column_config.ProgressColumn("Điểm vàng", min_value=0, max_value=100, format="%.1f"),
+    "data_quality_score": st.column_config.ProgressColumn("Chất lượng dữ liệu", min_value=0, max_value=100, format="%.1f"),
+    "sector_money_flow_score": st.column_config.ProgressColumn("Điểm tiền ngành", min_value=0, max_value=25, format="%.1f"),
     "victory_score": st.column_config.ProgressColumn("Điểm thắng TT", min_value=0, max_value=100, format="%.1f"),
     "concentration_score": st.column_config.ProgressColumn("Điểm cô đặc", min_value=0, max_value=100, format="%.1f"),
     "money_flow_score": st.column_config.ProgressColumn("Điểm dòng tiền", min_value=0, max_value=25, format="%.1f"),
 })
 
-st.subheader("6) Kế hoạch từng mã")
-sel = st.selectbox("Chọn mã", res.sort_values("victory_score", ascending=False).ticker.tolist())
+st.subheader("7) Kế hoạch từng mã")
+sel = st.selectbox("Chọn mã", res.sort_values("gold_score" if "gold_score" in res.columns else "victory_score", ascending=False).ticker.tolist())
 r = res[res.ticker == sel].iloc[0]
 g = details.get(sel)
 if g is not None and len(g):
@@ -1090,10 +1529,14 @@ c2.metric("Vùng mua đỏ", r.red_buy_zone)
 c3.metric("Cắt lỗ", r.stop_loss)
 c4.metric("R/R từ vùng mua", r.rr_to_base_high)
 st.markdown(f"""
-### {sel} — {r.victory_label}
+### {sel} — {getattr(r, 'gold_label', '')} | {r.victory_label}
+- **Cổng vàng:** {getattr(r, 'gold_gate', '')} | Điểm vàng: {getattr(r, 'gold_score', '')}
+- **Lý do giữ/loại:** {getattr(r, 'reject_reason', '')}
+- **Thời điểm vào:** {getattr(r, 'entry_timing', '')}
 - **Quyết định:** {r.action_decision}
 - **Pha:** {r.phase}
-- **Dòng tiền:** {r.money_flow_state} ({r.money_flow_score}/25)
+- **Dòng tiền:** {r.money_flow_state} ({r.money_flow_score}/25) | Ngành: {getattr(r, 'sector_state', '')} ({getattr(r, 'sector_money_flow_score', '')})
+- **Dữ liệu:** {getattr(r, 'data_quality_state', '')} ({getattr(r, 'data_quality_score', '')}/100), GTGD20: {getattr(r, 'val20_billion', '')} tỷ
 - **Bộ lọc cuối sóng:** {r.late_cycle_state} | Tăng chu kỳ: {r.cycle_return_pct}% | Tăng từ đáy: {r.runup_from_low_pct}% | Cách EMA50: {r.ema50_gap_pct}%
 - **Điều kiện mua:** {r.buy_trigger}
 - **Không mua khi:** {r.no_buy_when}
@@ -1102,6 +1545,6 @@ st.markdown(f"""
 - **Lý do:** {r.why_focus}
 """)
 
-st.subheader("7) Tải kết quả")
+st.subheader("8) Tải kết quả")
 csv = res.sort_values(["victory_score","concentration_score"], ascending=False).to_csv(index=False).encode("utf-8-sig")
-st.download_button("Tải CSV", data=csv, file_name="market_winner_v20_late_cycle_guard_results.csv", mime="text/csv")
+st.download_button("Tải CSV", data=csv, file_name="market_winner_v22_t1_early_alert_results.csv", mime="text/csv")
